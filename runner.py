@@ -20,6 +20,7 @@ import uuid
 import xml.etree.ElementTree as ET
 from zipfile import BadZipFile, ZipFile
 
+from dataset import export_dataset, publish_archive
 from machsuite.cases import cases as machsuite_cases
 from polybench.cases import cases as polybench_cases
 
@@ -240,6 +241,31 @@ def matches_version(detected, expected):
     return detected == expected
 
 
+def check_baseline_docs():
+    baseline = json.loads(BASELINE.read_text(encoding="utf-8"))
+    bambu, verilator = baseline["bambu"], baseline["verilator"]
+    host, hls, distro = baseline["clang_host"], baseline["clang_hls"], baseline["host_os"]
+    start, end = "<!-- baseline-spec:start -->", "<!-- baseline-spec:end -->"
+    block = "\n".join((
+        start, "", "| Component | Preflight baseline |", "|---|---|",
+        f"| Bambu | `{bambu['release']}`, commit prefix `{bambu['commit_prefix']}` |",
+        f"| Verilator | `{verilator['version']}`, revision `{verilator['revision']}` |",
+        f"| Host Clang | `{host['version']}` |",
+        f"| HLS Clang | `{hls['version']}` (`{hls['target']}`) |",
+        f"| Host OS | `{distro['id']}` `{distro['version']}` |", "", end,
+    ))
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    if readme.count(start) != 1 or readme.count(end) != 1 or block not in readme or (
+        "](environment_baseline.json)" not in readme
+    ):
+        print("README.md baseline is out of sync with environment_baseline.json. Expected block:",
+              file=sys.stderr)
+        print(block, file=sys.stderr)
+        return 1
+    print("README.md baseline matches environment_baseline.json.")
+    return 0
+
+
 def environment_warnings(baseline, versions, distro):
     warnings = []
 
@@ -300,7 +326,7 @@ def stage_case(case, snapshot, config_override, bambu):
     data = source_config.read_bytes()
     if b"!include" in data:
         raise ValueError("Use a self-contained YAML; Ramulator resolves !include relative to runtime paths")
-    yaml = snapshot / source_config.name
+    yaml = snapshot / (source_config.name if source_config.suffix in (".yaml", ".yml") else "ramulator2_config.yaml")
     yaml.write_bytes(data)
     members = case["members"]
     inputs = snapshot / "inputs"
@@ -442,7 +468,7 @@ def clean_work(run, dry_run):
     return removed
 
 
-def main(suite, tag, config, dry_run):
+def main(suite, tag, config, dry_run, archive_label=""):
     now = dt.datetime.now(dt.timezone.utc)
     run = create_run(tag, now)
     print(f"Run directory: {run}", flush=True)
@@ -483,7 +509,7 @@ def main(suite, tag, config, dry_run):
     }
     metadata["runner_sha256"] = {
         name: sha256(ROOT / name) for name in
-        ("run_tests.sh", "runner.py", "polybench/cases.py", "machsuite/cases.py")
+        ("run_tests.sh", "runner.py", "dataset.py", "polybench/cases.py", "machsuite/cases.py")
     }
     write_json(run / "metadata.json", metadata)
     for warning in warnings:
@@ -551,6 +577,11 @@ def main(suite, tag, config, dry_run):
                       f"{row.get('wall_time_s', '-'):>8} {str(row.get('dram_read_reqs', '-')):>9} "
                       f"{str(row.get('dram_write_reqs', '-')):>9}", flush=True)
     write_json(run / "metadata.json", metadata)
+    if archive_label and not preflight:
+        archive = publish_archive(run, archive_label, now.strftime("%Y%m%d_%H%M%S"))
+        metadata["archive_directory"] = str(archive.relative_to(RESULTS))
+        write_json(run / "metadata.json", metadata)
+        print(f"Archived experiment: {archive}", flush=True)
     (run / ".complete").touch()
     return int(failed)
 
@@ -563,7 +594,18 @@ if __name__ == "__main__":
     signal.signal(signal.SIGTERM, interrupt)
     signal.signal(signal.SIGHUP, interrupt)
     try:
-        sys.exit(main(*sys.argv[1:4], dry_run=sys.argv[4] == "1"))
+        if sys.argv[1:] == ["--check-baseline"]:
+            sys.exit(check_baseline_docs())
+        if sys.argv[1] == "--export-dataset":
+            output = Path(sys.argv[2]) if len(sys.argv) > 2 else RESULTS / "dataset.csv"
+            count = export_dataset(RESULTS / "archive", output)
+            print(f"Exported {count} rows to {output.resolve()}")
+            sys.exit(0)
+        sys.exit(main(*sys.argv[1:4], dry_run=sys.argv[4] == "1",
+                      archive_label=sys.argv[5] if len(sys.argv) > 5 else ""))
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        sys.exit(1)
     except KeyboardInterrupt:
         print("Interrupted; partial run evidence was retained.", file=sys.stderr)
         sys.exit(130)

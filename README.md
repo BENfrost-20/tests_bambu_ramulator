@@ -25,6 +25,23 @@ single eight-element AXI vector add from Bambu. Its expected result is
 
 The runner itself uses Python **3.8+** and its standard library.
 
+### Preflight baseline
+
+The version checks use [environment_baseline.json](environment_baseline.json).
+Run `./run_tests.sh --check-baseline` after changing the baseline or this table.
+
+<!-- baseline-spec:start -->
+
+| Component | Preflight baseline |
+|---|---|
+| Bambu | `2026.06`, commit prefix `909639b` |
+| Verilator | `4.028`, revision `v4.026-92-g890cecc1` |
+| Host Clang | `19.1.x` |
+| HLS Clang | `13.0.x` (`I386_CLANG13`) |
+| Host OS | `ubuntu` `20.04.x` |
+
+<!-- baseline-spec:end -->
+
 ## Environment and execution
 
 From Bash on the installed Linux host, use the appropriate local prefixes.
@@ -43,13 +60,9 @@ paths. The runner verifies the ELF32 library and adds its directory and
 fetched headers to the loader and compiler search paths for each case. Use
 installation and suite paths without whitespace for the Bambu backend.
 
-Preflight compares the tool and distro versions against
-[`environment_baseline.json`](environment_baseline.json). It checks the Bambu
-release and commit prefix, the Verilator release and revision, both Clang
-version series, and Ubuntu's version from `os-release`. The host Clang probe
+Preflight reads the distro version from `os-release`. The host Clang probe
 prefers the Clang 19 aliases on `PATH` and falls back to `clang`. The frontend
-probe uses the Clang 13 aliases for `I386_CLANG13`. These probes describe the
-active toolchain on `PATH`.
+probe uses the Clang 13 aliases for `I386_CLANG13`.
 
 Version mismatches print a yellow `[WARNING]` with the detected and expected
 values and are recorded under `environment_warnings` in `metadata.json`.
@@ -181,13 +194,41 @@ and an accepted Ramulator read with a completion under the recorded YAML.
 `FAIL` marks a functional mismatch or missing traffic evidence after a completed
 simulation. `ERROR` covers missing dependencies, setup failures, timeouts and
 incomplete result XML. A completed suite exits 1 if any case fails or errors.
-The checked-in vector fixture differs from the vault's two-case 237-cycle run.
+Cycle counts are measured outcomes for calibration and have no pass threshold.
 
-For calibration, keep source/input hashes, generated RTL, AXI flags, target
-device, queue depth, accelerator period and measurement window fixed. Compare
-`total_sim_cycles` with hardware accelerator cycles over the same start-to-done
-window, or multiply by the effective accelerator period for simulated time.
-`wall_time_s` is host execution time. Change one YAML parameter per tagged
-run and use the request counts and read completions to check that you are
-comparing the same traffic. MDPI log ticks describe the bridge calls. Detailed
-command timings and physical channel balance require separate evidence.
+### Archive an experiment
+
+```bash
+./run_tests.sh --suite micro --config configs/xcu250_ddr4_2400R.yaml --archive ddr4-four-channel
+./run_tests.sh --export-dataset results/calibration.csv
+```
+
+`--archive LABEL` publishes finished simulations, including failed cases, in
+`results/archive/YYYYMMDD_HHMMSS_LABEL/` (UTC). Use it with a simulation suite,
+optionally in tmux. Preflight failures and interrupted runs retain their local
+records. The archive contains only `metadata.json`, `summary.csv`,
+`config_snapshot/*.yaml` and `logs/*.log.gz`. Case metadata includes exact
+Bambu arguments and source/input hashes. Once publication succeeds, the runner
+removes the temporary work tree and uncompressed logs. The local summary
+references the compressed logs, and `results/latest` still points at the local
+run. Git can track the curated files and ignores ordinary runs and build outputs.
+
+`--export-dataset [output.csv]` reads the archives without running preflight
+and writes one row per case, including its status. The default output is
+`results/dataset.csv`. Columns include run identity, YAML and input hashes,
+DRAM timing and topology, HLS options and `define_*` macros, and the observed
+cycles, wall time and request counts. `hls_flags` retains the complete argument
+array as JSON in one CSV column.
+
+The exporter reads scalar YAML block mappings and JSON-formatted YAML. It
+resolves the timing presets shipped in `configs/` against the pinned Ramulator
+source. Explicit cycle overrides take precedence over nanosecond values.
+For a nanosecond-only override, the CSV records the requested value and leaves
+its cycle field blank. Unsupported YAML mappings and unknown preset values
+leave affected fields blank and are described in `dram_feature_note`.
+
+For fitting, filter to `PASS` rows with the metrics and features your model
+uses. When pairing simulation and hardware measurements, match the workload
+and input hashes and use the same start-to-done window. Multiply
+`total_sim_cycles` by `hls_clock_period_ns` to get simulated nanoseconds.
+`wall_time_s` measures host execution time.

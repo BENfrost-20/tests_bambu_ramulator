@@ -4,15 +4,32 @@ set -euo pipefail
 usage() {
     cat <<'HELP'
 Usage: run_tests.sh [--smoke | --all | --suite NAME | --clean]
-                    [--config PATH] [--tag LABEL] [--dry-run] [--tmux]
+                    [--config PATH] [--tag LABEL] [--archive LABEL] [--dry-run] [--tmux]
+       run_tests.sh --export-dataset [output.csv]
+       run_tests.sh --check-baseline
 Suites: smoke, micro, polybench, machsuite, diagnostic
 Default: --smoke. --all runs the four regular suites.
 --clean removes work directories from finished runs and preserves evidence.
 --tmux starts a detached session, or runs inline from an existing tmux pane.
+--archive publishes curated telemetry and removes temporary build artifacts.
 HELP
 }
 
 die() { printf '%s\n' "$*" >&2; exit 2; }
+
+root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+export PYTHONDONTWRITEBYTECODE=1
+case "${1:-}" in
+    --check-baseline|--export-dataset)
+        if [[ "$1" == --check-baseline ]]; then
+            [[ $# -eq 1 ]] || die "--check-baseline does not take arguments."
+        else
+            [[ $# -le 2 && "${2:-}" != --* ]] || die "--export-dataset takes at most one output path."
+        fi
+        command -v python3 >/dev/null || die "python3 is required."
+        exec python3 "$root/runner.py" "$@"
+        ;;
+esac
 
 run_in_tmux() {
     local session="bambu_test_${tag//./_}"
@@ -55,6 +72,7 @@ original_args=("$@")
 suite=""
 config=""
 tag=""
+archive=""
 dry_run=0
 detach=0
 while [[ $# -gt 0 ]]; do
@@ -64,7 +82,7 @@ while [[ $# -gt 0 ]]; do
             suite="${1#--}"
             shift
             ;;
-        --suite|--config|--tag)
+        --suite|--config|--tag|--archive)
             [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || die "$1 requires a value."
             case "$1" in
                 --suite)
@@ -76,6 +94,7 @@ while [[ $# -gt 0 ]]; do
                     ;;
                 --config) config="$2" ;;
                 --tag) tag="$2" ;;
+                --archive) archive="$2" ;;
             esac
             shift 2
             ;;
@@ -87,11 +106,14 @@ while [[ $# -gt 0 ]]; do
 done
 
 suite="${suite:-smoke}"
-tag="${tag:-$suite}"
+tag="${tag:-${archive:-$suite}}"
 [[ "$tag" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$ ]] || die "Invalid tag (use 1–64 letters, digits, dots, underscores or hyphens)."
+if [[ -n "$archive" ]]; then
+    [[ "$archive" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$ ]] || die "Invalid archive label (use the same format as --tag)."
+    [[ "$suite" != clean && "$dry_run" -eq 0 ]] || die "--archive requires a simulation suite without --dry-run."
+fi
 [[ "$suite" != clean || -z "$config" ]] || die "--clean does not take --config."
 command -v python3 >/dev/null || die "python3 is required."
-root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 if (( detach )); then
     if [[ -n "${TMUX:-}" ]]; then
         printf 'Already inside tmux. Running in this pane.\n'
@@ -101,5 +123,4 @@ if (( detach )); then
         exit 0
     fi
 fi
-export PYTHONDONTWRITEBYTECODE=1
-exec python3 "$root/runner.py" "$suite" "$tag" "$config" "$dry_run"
+exec python3 "$root/runner.py" "$suite" "$tag" "$config" "$dry_run" "$archive"
