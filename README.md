@@ -43,6 +43,20 @@ paths. The runner verifies the ELF32 library and adds its directory and
 fetched headers to the loader and compiler search paths for each case. Use
 installation and suite paths without whitespace for the Bambu backend.
 
+Preflight compares the tool and distro versions against
+[`environment_baseline.json`](environment_baseline.json). It checks the Bambu
+release and commit prefix, the Verilator release and revision, both Clang
+version series, and Ubuntu's version from `os-release`. The host Clang probe
+prefers the Clang 19 aliases on `PATH` and falls back to `clang`. The frontend
+probe uses the Clang 13 aliases for `I386_CLANG13`. These probes describe the
+active toolchain on `PATH`.
+
+Version mismatches print a yellow `[WARNING]` with the detected and expected
+values and are recorded under `environment_warnings` in `metadata.json`.
+Missing required binaries or environment variables, failed tool probes, and
+unsupported host architectures stop the run before case staging. This also
+applies to `--dry-run`. `--clean` can run without the simulation toolchain.
+
 ```bash
 ./run_tests.sh --all --tag ddr4-baseline
 ./run_tests.sh --suite micro --dry-run --tag inspect
@@ -75,6 +89,37 @@ installation and suite paths without whitespace for the Bambu backend.
   header-only CSV. `--clean` removes intermediate `work/` directories
   from completed runs and preserves run metadata, snapshots, logs and
   retained result XML. Each of these commands creates its own run record.
+
+## Running Long Test Suites in Background (tmux)
+
+On the Ubuntu host, activate the toolchain as above and run this command from
+the suite directory with `tmux` installed.
+
+```bash
+./run_tests.sh --all --tag ddr4-baseline --tmux
+```
+
+The launcher starts `bambu_test_ddr4-baseline` in the background and returns
+control to your shell. It keeps your working directory and exported environment,
+including `RAMULATOR2_DIR`, `LD_LIBRARY_PATH` and `PATH`, even if the tmux server
+was started before you activated the toolchain. From an existing tmux pane,
+`--tmux` runs the suite in that pane. The session suffix defaults to the suite
+name if you omit `--tag`. Dots in tags become underscores in session names.
+Use distinct session names for concurrent runs.
+
+To see the console, run `tmux attach -t bambu_test_ddr4-baseline`. Press
+**Ctrl+b**, then **d** to detach. You can close SSH or your laptop after
+detaching. The session continues on the Ubuntu host as long as the host and
+tmux server stay up. Reconnect over SSH to the same host and run the attach
+command again. The session normally closes when the runner finishes, and its
+results remain on disk.
+
+From the suite directory on the host, run `watch -n 2 cat results/latest/summary.csv`
+to follow the CSV as cases finish. With concurrent runs, use the specific
+`results/run_.../summary.csv` printed in the pane because `latest` follows the
+most recently started run. The corresponding files under `logs/` show output
+for cases still running. To stop a run launched with `--tmux`, use
+`tmux kill-session -t =bambu_test_ddr4-baseline`. Partial results are retained.
 
 ## Microbenchmarks
 

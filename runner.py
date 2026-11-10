@@ -26,6 +26,8 @@ from polybench.cases import cases as polybench_cases
 
 ROOT = Path(__file__).resolve().parent
 RESULTS = ROOT / "results"
+BASELINE = ROOT / "environment_baseline.json"
+HLS_COMPILER = "I386_CLANG13"
 SMOKE = "default_ddr4.yaml"
 U250 = "xcu250_ddr4_2400R.yaml"
 PERIODS = {
@@ -38,7 +40,7 @@ COLUMNS = (
     "dram_write_reqs", "yaml_config", "log_file",
 )
 COMMON = [
-    "--simulate", "--simulator=VERILATOR", "--compiler=I386_CLANG13", "-m32",
+    "--simulate", "--simulator=VERILATOR", f"--compiler={HLS_COMPILER}", "-m32",
     "--generate-interface=INFER", "--memory-allocation-policy=NO_BRAM",
     "--enable-ramulator-integrated", "--device-name=xcu250-2Lfigd2104",
     "--output-directory=output", "-v5",
@@ -156,9 +158,16 @@ def inspect_host():
         "bash", "awk", "bc", "envsubst", "timeout",
     )
     paths = {name: shutil.which(name) for name in names}
-    versions = {name: capture([paths[name], "--version"]) if paths[name] else None
-                for name in ("bambu", "verilator")}
     errors = [f"{name} was not found on PATH" for name, path in paths.items() if not path]
+    for name, aliases in (
+        ("clang_host", ("clang-19", "clang-19.0", "clang19", "clang")),
+        ("clang_hls", ("clang-13", "clang-13.0", "clang13")),
+    ):
+        paths[name] = next((path for path in map(shutil.which, aliases) if path), None)
+        if not paths[name]:
+            errors.append(f"{name} was not found on PATH (tried {', '.join(aliases)})")
+    versions = {name: capture([paths[name], "--version"]) if paths[name] else None
+                for name in ("bambu", "verilator", "clang_host", "clang_hls")}
     for name, version in versions.items():
         if version and version["exit_code"] != 0:
             errors.append(f"{name} --version failed")
@@ -207,6 +216,83 @@ def inspect_host():
     for variable in ("OUT_LVL", "BAMBU_IPC_SIM_CMD", "RAMULATOR_OVERRIDE_CHANNELS"):
         env.pop(variable, None)
     return paths, versions, env, library_info, errors
+
+
+def read_os_release():
+    for path in (Path("/etc/os-release"), Path("/usr/lib/os-release")):
+        try:
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            continue
+        fields = {}
+        for line in lines:
+            key, _, value = line.partition("=")
+            if key in ("ID", "VERSION_ID", "PRETTY_NAME"):
+                fields[key] = value.strip().strip("\"'")
+        return fields
+    return {}
+
+
+def matches_version(detected, expected):
+    if expected.endswith(".x"):
+        prefix = re.escape(expected[:-2])
+        return bool(re.fullmatch(prefix + r"(?:\.\d+)?", detected or ""))
+    return detected == expected
+
+
+def environment_warnings(baseline, versions, distro):
+    warnings = []
+
+    def output(name):
+        probe = versions[name]
+        return probe["output"] if probe and probe["exit_code"] == 0 else None
+
+    def extract(text, pattern):
+        match = re.search(pattern, text, re.IGNORECASE)
+        return match[1] if match else "unavailable"
+
+    def report(component, detected, expected, matches):
+        if not matches:
+            warnings.append({"component": component, "detected": detected, "expected": expected})
+
+    expected = baseline["bambu"]
+    release, commit = expected["release"], expected["commit_prefix"]
+    banner = output("bambu")
+    if banner is not None:
+        actual_release = extract(banner, r"\b(?:PandA|Bambu)\s+(\d+(?:\.\d+)+)\b")
+        actual_commit = extract(banner, r"\brevision\s+([0-9a-f]{7,40})\b")
+        report("Bambu", f"{actual_release} / commit {actual_commit}", f"{release} / commit {commit}",
+               actual_release == release and actual_commit.lower().startswith(commit.lower()))
+
+    expected = baseline["verilator"]
+    version, revision = expected["version"], expected["revision"]
+    banner = output("verilator")
+    if banner is not None:
+        actual_version = extract(banner, r"\bVerilator\s+(\d+(?:\.\d+)+)\b")
+        actual_revision = extract(banner, r"\b(v\d+(?:\.\d+)+[\w.-]*)")
+        report("Verilator", f"{actual_version} ({actual_revision})", f"{version} ({revision})",
+               actual_version == version and actual_revision == revision)
+
+    hls_target = baseline["clang_hls"]["target"]
+    for name, label in (("clang_host", "Host Clang"), ("clang_hls", "HLS Clang")):
+        expected = baseline[name]["version"]
+        banner = output(name)
+        if banner is not None:
+            detected = extract(banner, r"\bclang\s+version\s+(\d+(?:\.\d+)+)")
+            matches = matches_version(detected, expected)
+            if name == "clang_hls":
+                matches = matches and HLS_COMPILER == hls_target
+                detected, expected = f"{detected} ({HLS_COMPILER})", f"{expected} ({hls_target})"
+            report(label, detected, expected, matches)
+
+    expected = baseline["host_os"]
+    distro_id, version = expected["id"], expected["version"]
+    detected_id = distro.get("ID", "unavailable")
+    detected_version = distro.get("VERSION_ID", "unavailable")
+    report("Host OS", distro.get("PRETTY_NAME") or f"{detected_id} {detected_version}",
+           f"{distro_id} {version}",
+           detected_id.lower() == distro_id.lower() and matches_version(detected_version, version))
+    return warnings
 
 
 def stage_case(case, snapshot, config_override, bambu):
@@ -360,14 +446,28 @@ def main(suite, tag, config, dry_run):
     now = dt.datetime.now(dt.timezone.utc)
     run = create_run(tag, now)
     print(f"Run directory: {run}", flush=True)
-    paths, versions, env, library, preflight = inspect_host()
+    paths, versions, env, library, preflight = {}, {}, os.environ.copy(), None, []
+    baseline, distro, warnings = None, {}, []
+    timeout_text = os.environ.get("CASE_TIMEOUT_S", "2700")
+    if suite != "clean":
+        paths, versions, env, library, preflight = inspect_host()
+        distro = read_os_release()
+        try:
+            baseline = json.loads(BASELINE.read_text(encoding="utf-8"))
+            warnings = environment_warnings(baseline, versions, distro)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            preflight.append(f"Invalid environment baseline {BASELINE}: {exc}")
+        if not re.fullmatch(r"[1-9][0-9]*", timeout_text):
+            preflight.append("CASE_TIMEOUT_S must be a positive integer")
+        if any(ch.isspace() for ch in str(run)):
+            preflight.append("The Bambu backend requires a workspace path without whitespace")
     config_override = config or os.environ.get("RAMULATOR2_CONFIG", "")
     metadata = {
         "timestamp_utc": now.isoformat(), "suite": suite, "tag": tag, "dry_run": dry_run,
         "git_commit": capture(["git", "rev-parse", "HEAD"], ROOT)["output"],
         "git_status": capture(["git", "status", "--porcelain"], ROOT)["output"],
         "user": getpass.getuser(), "host": socket.gethostname(),
-        "os": platform.platform(), "architecture": platform.machine(),
+        "os": platform.platform(), "os_release": distro, "architecture": platform.machine(),
         "environment": {key: os.environ.get(key) for key in (
             "BAMBU_HLS", "BAMBU_HLS_BACKEND_PATH", "RAMULATOR2_DIR", "RAMULATOR2_CONFIG",
             "RAMULATOR_OVERRIDE_CHANNELS", "LD_LIBRARY_PATH", "CPLUS_INCLUDE_PATH",
@@ -378,6 +478,7 @@ def main(suite, tag, config, dry_run):
         )},
         "config_override": str(Path(config_override).resolve()) if config_override else None,
         "tool_paths": paths, "tool_versions": versions, "ramulator_library": library,
+        "environment_baseline": baseline, "environment_warnings": warnings,
         "preflight_errors": preflight, "cases": {},
     }
     metadata["runner_sha256"] = {
@@ -385,6 +486,9 @@ def main(suite, tag, config, dry_run):
         ("run_tests.sh", "runner.py", "polybench/cases.py", "machsuite/cases.py")
     }
     write_json(run / "metadata.json", metadata)
+    for warning in warnings:
+        print(f"\033[33m[WARNING]\033[0m {warning['component']} detected {warning['detected']} "
+              f"(expected {warning['expected']})", flush=True)
     failed = False
     with (run / "summary.csv").open("w", newline="", encoding="utf-8") as output:
         writer = csv.DictWriter(output, COLUMNS)
@@ -395,16 +499,11 @@ def main(suite, tag, config, dry_run):
             verb = "Would remove" if dry_run else "Removed"
             metadata["clean_work_directories"] = removed
             print(f"{verb} {len(removed)} finished work directories.")
+        elif preflight:
+            for error in preflight:
+                print(f"[ERROR] Pre-flight: {error}", file=sys.stderr)
+            failed = True
         else:
-            timeout_text = os.environ.get("CASE_TIMEOUT_S", "2700")
-            if not re.fullmatch(r"[1-9][0-9]*", timeout_text):
-                preflight.append("CASE_TIMEOUT_S must be a positive integer")
-            if any(ch.isspace() for ch in str(run)):
-                preflight.append("The Bambu backend requires a workspace path without whitespace")
-            if preflight:
-                label = "Pre-flight (dry run)" if dry_run else "Pre-flight"
-                for error in preflight:
-                    print(f"{label}: {error}", file=sys.stderr)
             print(f"{'TEST':<25} {'STATUS':<7} {'CYCLES':>11} {'WALL S':>8} {'READS':>9} {'WRITES':>9}", flush=True)
             for case in select_cases(suite):
                 name = case["name"]
@@ -415,7 +514,7 @@ def main(suite, tag, config, dry_run):
                 details = {}
                 started = time.monotonic()
                 try:
-                    argv, yaml = stage_case(case, snapshot, config_override, paths["bambu"] or "bambu")
+                    argv, yaml = stage_case(case, snapshot, config_override, paths["bambu"])
                     row["yaml_config"] = str(yaml.relative_to(run))
                     if dry_run:
                         log.write_text(f"RAMULATOR2_CONFIG={shlex.quote(str(yaml))}\n$ {shlex.join(argv)}\n",
@@ -423,8 +522,6 @@ def main(suite, tag, config, dry_run):
                         print(f"{name:<25} PLANNED", flush=True)
                         metadata["cases"][name] = {"planned": True, "yaml_config": str(yaml)}
                         continue
-                    if preflight:
-                        raise ValueError("pre-flight failed; see metadata.json")
                     work = run / "work" / name
                     (work / "tmp").mkdir(parents=True)
                     case_env = dict(env, RAMULATOR2_CONFIG=str(yaml), TMPDIR=str(work / "tmp"),
@@ -464,6 +561,7 @@ def interrupt(_signal, _frame):
 
 if __name__ == "__main__":
     signal.signal(signal.SIGTERM, interrupt)
+    signal.signal(signal.SIGHUP, interrupt)
     try:
         sys.exit(main(*sys.argv[1:4], dry_run=sys.argv[4] == "1"))
     except KeyboardInterrupt:

@@ -4,18 +4,59 @@ set -euo pipefail
 usage() {
     cat <<'HELP'
 Usage: run_tests.sh [--smoke | --all | --suite NAME | --clean]
-                    [--config PATH] [--tag LABEL] [--dry-run]
+                    [--config PATH] [--tag LABEL] [--dry-run] [--tmux]
 Suites: smoke, micro, polybench, machsuite, diagnostic
 Default: --smoke. --all runs the four regular suites.
 --clean removes work directories from finished runs and preserves evidence.
+--tmux starts a detached session, or runs inline from an existing tmux pane.
 HELP
 }
 
 die() { printf '%s\n' "$*" >&2; exit 2; }
+
+run_in_tmux() {
+    local session="bambu_test_${tag//./_}"
+    local snapshot
+    snapshot="$(mktemp "${TMPDIR:-/tmp}/bambu-tmux-env.XXXXXXXX")"
+    trap 'rm -f -- "$snapshot"' EXIT
+    # A running tmux server may have an older environment. Keep exports and
+    # arguments in a private file, separated by an empty NUL-delimited field.
+    {
+        printf '%s\0' "$root/run_tests.sh" "$@"
+        printf '\0'
+        /usr/bin/env -0
+    } > "$snapshot"
+    if ! tmux new-session -d -s "$session" -c "$PWD" -- \
+        "$(command -v python3)" -I -c '
+import os
+import sys
+
+snapshot = sys.argv[1]
+with open(snapshot, "rb") as stream:
+    command, exports = stream.read().split(b"\0\0", 1)
+os.unlink(snapshot)
+script, *args = command.split(b"\0")
+env = dict(entry.split(b"=", 1) for entry in exports.split(b"\0") if entry)
+for name in (b"TMUX", b"TMUX_PANE", b"TERM"):
+    if name in os.environb:
+        env[name] = os.environb[name]
+os.execve(script, [script, *(arg for arg in args if arg != b"--tmux")], env)
+' "$snapshot"; then
+        die "Could not start tmux session $session. If the name is in use, choose a different --tag."
+    fi
+    trap - EXIT
+    printf 'Started detached tmux session %s\n' "$session"
+    printf 'Attach: tmux attach -t %s\n' "$session"
+    printf 'Live summary (from %s): watch -n 2 cat results/latest/summary.csv\n' "$root"
+    printf 'Stop: tmux kill-session -t =%s\n' "$session"
+}
+
+original_args=("$@")
 suite=""
 config=""
 tag=""
 dry_run=0
+detach=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --smoke|--all|--clean)
@@ -39,6 +80,7 @@ while [[ $# -gt 0 ]]; do
             shift 2
             ;;
         --dry-run) dry_run=1; shift ;;
+        --tmux) detach=1; shift ;;
         --help|-h) usage; exit 0 ;;
         *) die "Unknown option: $1" ;;
     esac
@@ -50,5 +92,14 @@ tag="${tag:-$suite}"
 [[ "$suite" != clean || -z "$config" ]] || die "--clean does not take --config."
 command -v python3 >/dev/null || die "python3 is required."
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+if (( detach )); then
+    if [[ -n "${TMUX:-}" ]]; then
+        printf 'Already inside tmux. Running in this pane.\n'
+    else
+        command -v tmux >/dev/null || die "tmux is required for --tmux. Install it or run without --tmux."
+        run_in_tmux "${original_args[@]}"
+        exit 0
+    fi
+fi
 export PYTHONDONTWRITEBYTECODE=1
 exec python3 "$root/runner.py" "$suite" "$tag" "$config" "$dry_run"
