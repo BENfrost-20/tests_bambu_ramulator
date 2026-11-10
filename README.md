@@ -23,9 +23,6 @@ single eight-element AXI vector add from Bambu. Its expected result is
 | Ramulator dependencies | yaml-cpp **0.7.0**, argparse **2.9** | Fetched headers; yaml-cpp links into Ramulator, argparse serves its CLI |
 | Shell and utilities | Bash, GNU Make, binutils (`objcopy`, `readelf`), `ldd`, Git, GNU coreutils, `awk`, `bc`, `envsubst` | Runtime, linkage checks and provenance; versions unrecorded |
 
-The source for the recorded versions is the vault's
-[Server and Toolchain Setup](../../thesis-vault/Topics/Server%20and%20Toolchain%20Setup.md)
-and [Experimental Setup and Reproduction Protocol](../../thesis-vault/Topics/Experimental%20Setup%20and%20Reproduction%20Protocol.md).
 The runner itself uses Python **3.8+** and its standard library.
 
 ## Environment and execution
