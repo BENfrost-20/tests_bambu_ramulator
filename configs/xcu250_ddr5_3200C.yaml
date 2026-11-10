@@ -1,0 +1,28 @@
+Frontend:
+  impl: GEM5
+
+MemorySystem:
+  impl: GenericDRAM
+  clock_ratio: 6
+
+  DRAM:
+    impl: DDR5
+    org:
+      preset: DDR5_16Gb_x8
+      channel: 4
+      rank: 1
+    timing:
+      preset: DDR5_3200C
+
+  Controller:
+    impl: Generic
+    Scheduler:
+      impl: FRFCFS
+    RefreshManager:
+      impl: AllBank
+    RowPolicy:
+      impl: ClosedRowPolicy
+      cap: 4
+
+  AddrMapper:
+    impl: RoBaRaCoCh
