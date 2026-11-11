@@ -15,6 +15,7 @@ import tempfile
 # rate (MT/s), nBL, nRCD (read), nRP, nRCDWR (if distinct).
 # Values from src/dram/impl/{DDR3,DDR4,DDR5,HBM2}.cpp at d1723a4.
 TIMING_PRESETS = {
+    ("DDR3", "DDR3_800D"): (800, 4, 5, 5, None),
     ("DDR3", "DDR3_1600K"): (1600, 4, 11, 11, None),
     ("DDR4", "DDR4_2400R"): (2400, 4, 16, 16, None),
     ("DDR5", "DDR5_3200C"): (3200, 8, 28, 28, None),
@@ -65,11 +66,15 @@ def read_csv(path):
 
 def publish_archive(run, label, timestamp):
     """Publish a small, relocatable archive before removing any local artifacts."""
-    archive_root = run.parent / "archive"
-    archive_root.mkdir(exist_ok=True)
     columns, rows = read_csv(run / "summary.csv")
     metadata = json.loads((run / "metadata.json").read_text(encoding="utf-8"))
-    metadata.update(archive_schema_version=1, experiment_label=label, source_run=run.name)
+    board = metadata.get("board_profile", {}).get("name", "unknown")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", board):
+        raise ValueError(f"Invalid archive board {board}")
+    archive_root = run.parent / "archive" / board
+    archive_root.mkdir(parents=True, exist_ok=True)
+    metadata.update(archive_schema_version=2, experiment_label=label, source_run=run.name)
+    columns = ["board", *(column for column in columns if column != "board")]
     logs = []
     with tempfile.TemporaryDirectory(prefix=".pending-", dir=archive_root) as temporary:
         pending = Path(temporary)
@@ -77,6 +82,7 @@ def publish_archive(run, label, timestamp):
         (pending / "logs").mkdir()
         curated = []
         for row in rows:
+            row["board"] = board
             archived = row.copy()
             name = row["test_name"]
             case = metadata["cases"][name]
@@ -97,7 +103,7 @@ def publish_archive(run, label, timestamp):
         write_csv(pending / "summary.csv", columns, curated)
         (pending / "metadata.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n",
                                                encoding="utf-8")
-        prefix = f"{timestamp}_{label}"
+        prefix = f"run_{timestamp}_{metadata.get('tag') or label}"
         for index in range(1000):
             archive = archive_root / (f"{prefix}_{index + 1}" if index else prefix)
             if archive.exists():
@@ -230,33 +236,38 @@ def hls_features(flags):
     return features
 
 
-def export_dataset(archive_root, output):
-    output = output.resolve()
-    if archive_root.resolve() in output.parents:
-        raise ValueError("Choose an export path outside the curated archive")
-    rows, defines = [], set()
-    metrics = ("total_sim_cycles", "wall_time_s", "dram_read_reqs", "dram_write_reqs")
-    identifiers = ("archive_id", "experiment_label", "timestamp_utc", "suite", "git_commit",
-                   "ramulator_sha256", "test_name", "status", "yaml_config", "log_file", "yaml_sha256",
-                   "inputs_sha256")
-    for archive in sorted(archive_root.glob("[!.]*")):
-        if not archive.is_dir() or archive.is_symlink():
+def dataset_rows(archive_root):
+    summaries = [*archive_root.glob("[!.]*/summary.csv"), *archive_root.glob("[!.]*/[!.]*/summary.csv")]
+    for summary_path in sorted(summaries):
+        archive = summary_path.parent
+        if archive.is_symlink() or archive.parent.is_symlink():
             continue
         metadata = json.loads((archive / "metadata.json").read_text(encoding="utf-8"))
-        _, summary = read_csv(archive / "summary.csv")
+        profile = metadata.get("board_profile", {})
+        _, summary = read_csv(summary_path)
         for case in summary:
             inputs = metadata.get("cases", {}).get(case["test_name"], {}).get("inputs", {})
             yaml = case.get("yaml_config")
             flags = hls_features(inputs.get("argv", [])[1:])
-            defines.update(key for key in flags if key.startswith("define_"))
-            row = {key: case.get(key) for key in ("test_name", "status", "yaml_config", "log_file", *metrics)}
+            legacy_board = {"xcu250-2Lfigd2104": "xcu250", "xc7z020-1clg484": "xc7z020"}.get(
+                flags.get("hls_device"), "unknown")
+            row = {key: case.get(key) for key in (
+                "test_name", "status", "yaml_config", "log_file",
+                "total_sim_cycles", "wall_time_s", "dram_read_reqs", "dram_write_reqs")}
             row.update(
-                archive_id=archive.name, experiment_label=metadata.get("experiment_label"),
+                board=case.get("board") or profile.get("name") or (
+                    archive.parent.name if archive.parent != archive_root else legacy_board),
+                archive_id=str(archive.relative_to(archive_root)), experiment_label=metadata.get("experiment_label"),
                 timestamp_utc=metadata.get("timestamp_utc"), suite=metadata.get("suite"),
                 git_commit=metadata.get("git_commit"),
                 ramulator_sha256=(metadata.get("ramulator_library") or {}).get("sha256"),
                 yaml_sha256=inputs.get("yaml_sha256"),
                 inputs_sha256=json.dumps(inputs["inputs_sha256"], sort_keys=True) if "inputs_sha256" in inputs else None,
+                cycles=case.get("total_sim_cycles"), dram_reads=case.get("dram_read_reqs"),
+                dram_writes=case.get("dram_write_reqs"), timestamp=metadata.get("timestamp_utc"),
+                clock_ns=flags.get("hls_clock_period_ns") or (
+                    metadata.get("environment", {}).get("CLOCK_PERIOD_NS") or profile.get("default_clock_ns")),
+                ramulator_config=Path(inputs.get("yaml_source") or yaml).name if yaml else None,
             )
             if yaml:
                 yaml_path = archive / yaml
@@ -264,9 +275,39 @@ def export_dataset(archive_root, output):
                     raise ValueError(f"Archived YAML hash does not match metadata for {yaml_path}")
                 row.update(dram_features(yaml_path))
             row.update(flags)
-            rows.append(row)
+            yield row
+
+
+def export_dataset(archive_root, output):
+    output = output.resolve()
+    if archive_root.resolve() in output.parents:
+        raise ValueError("Choose an export path outside the curated archive")
+    rows = list(dataset_rows(archive_root))
+    defines = sorted({key for row in rows for key in row if key.startswith("define_")})
+    identifiers = (
+        "board", "test_name", "status", "cycles", "dram_reads", "dram_writes",
+        "clock_ns", "ramulator_config", "timestamp", "archive_id", "experiment_label",
+        "timestamp_utc", "suite", "git_commit", "ramulator_sha256", "yaml_config",
+        "log_file", "yaml_sha256", "inputs_sha256",
+    )
+    metrics = ("total_sim_cycles", "wall_time_s", "dram_read_reqs", "dram_write_reqs")
     columns = (*identifiers, *DRAM_COLUMNS, *("hls_" + key for key in HLS_OPTIONS.values()),
                "hls_bus_pipelined", "hls_flags", *sorted(defines), *metrics)
     output.parent.mkdir(parents=True, exist_ok=True)
     write_csv(output, columns, rows)
     return len(rows)
+
+
+def compare_test(archive_root, test_name):
+    rows = sorted((row for row in dataset_rows(archive_root) if row["test_name"] == test_name),
+                  key=lambda row: (row["board"], row.get("timestamp") or "", row["archive_id"]))
+    if not rows:
+        print(f"No archived records for test {test_name}.")
+        return
+    columns = ("board", "status", "cycles", "dram_reads", "dram_writes", "clock_ns", "ramulator_config", "timestamp")
+    cells = [[str(row[key]) if row.get(key) not in (None, "") else "-" for key in columns] for row in rows]
+    widths = [max(len(key), *(len(row[index]) for row in cells)) for index, key in enumerate(columns)]
+    print(f"Archived results for {test_name}")
+    print("  ".join(key.upper().ljust(width) for key, width in zip(columns, widths)))
+    for row in cells:
+        print("  ".join(value.ljust(width) for value, width in zip(row, widths)))

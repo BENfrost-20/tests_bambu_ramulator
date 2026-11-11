@@ -85,16 +85,18 @@ applies to `--dry-run`. `--clean` can run without the simulation toolchain.
   The workload recipes stage original files from the sibling `Archive 2/`
   directory. Use `BENCHMARK_ARCHIVES` to point to the directory containing the
   ZIPs on a different host.
-- YAML selection is `--config`, then inherited `RAMULATOR2_CONFIG`, then the
-  case preset. Overrides apply to every case, including both T09 variants.
+- YAML selection is `--config`, then an explicit diagnostic preset when using
+  `--suite diagnostic`, then the selected board's default. Overrides apply to
+  every case, including both T09 variants. The inherited `RAMULATOR2_CONFIG`
+  is recorded for provenance, and each case sets it to its chosen YAML snapshot.
   Use a self-contained YAML. The runner preserves the exact bytes and points
   the driver at the snapshot. It clears `RAMULATOR_OVERRIDE_CHANNELS` so
   DRAM topology stays in YAML. Bambu channels are a separate synthesis flag.
-- The smoke preset uses **10 ns**, 1 channel and ratio 3. The U250 preset uses
-  **5 ns**, 4 channels and ratio 6. The one-channel U250 variant changes only
-  the channel count. Bundled alternate presets have explicit clock periods
-  in the runner. Set `CLOCK_PERIOD_NS` for a custom YAML if it needs a clock
-  different from the case default. The effective period is in the flag snapshot.
+- The default `xcu250` profile uses **5 ns**, 4 DRAM channels and ratio 6.
+  `CLOCK_PERIOD_NS` overrides the profile clock. `--config` changes only the
+  memory config, so set the clock explicitly when that experiment requires it.
+  To replay the original 10 ns single-channel smoke setup, use
+  `CLOCK_PERIOD_NS=10 ./run_tests.sh --smoke --config configs/default_ddr4.yaml`.
 - `CASE_TIMEOUT_S` defaults to **2700** seconds per case. The runner uses a
   private working directory, IPC filename, temporary directory and process
   group per case. `--dry-run` stages inputs and commands without synthesis
@@ -102,6 +104,55 @@ applies to `--dry-run`. `--clean` can run without the simulation toolchain.
   header-only CSV. `--clean` removes intermediate `work/` directories
   from completed runs and preserves run metadata, snapshots, logs and
   retained result XML. Each of these commands creates its own run record.
+
+## Board profiles and comparisons
+
+```bash
+./run_tests.sh --list-boards
+./run_tests.sh --smoke --board xcu250 --archive board-comparison
+./run_tests.sh --smoke --board xcu280 --archive board-comparison
+./run_tests.sh --smoke --board xcu55c --archive board-comparison
+./run_tests.sh --compare-test smoke_vector_add
+./run_tests.sh --export-dataset results/cross-board.csv
+```
+
+Profiles live in [configs/boards.json](configs/boards.json). The default board
+is `xcu250`.
+
+| Board | Bambu device | Clock (ns) | Memory config | Status |
+|---|---|---:|---|---|
+| `xcu250` | `xcu250-figd2104-2L-e` | 5.0 | `configs/xcu250_ddr4_2400R.yaml`, DDR4, 4 channels | stable |
+| `xcu280` | `xcu280-2Lfsvh2892` | 4.0 | `configs/xcu280_hbm2.yaml`, HBM2, 32 channels | experimental |
+| `xcu55c` | `xcu55c-2Lfsvh2892` | 3.33 | `configs/xcu280_hbm2.yaml`, HBM2e target, 32 channels | experimental |
+
+U280 and U55C share the existing `HBM2` Ramulator implementation and timing
+preset. The profile status is shown by `--list-boards` and retained in run
+metadata. The HBM refresh limitation described below applies to both profiles.
+
+To add a board, append an object with these fields to `configs/boards.json`.
+
+```json
+{
+  "name": "my_board",
+  "bambu_device": "exact-device-name-supported-by-your-bambu",
+  "default_clock_ns": 10.0,
+  "default_ramulator_yaml": "configs/my_board.yaml",
+  "description": "Description of the target and memory scenario",
+  "status": "experimental"
+}
+```
+
+Add the paired YAML at the path relative to the suite root, then run
+`--list-boards` to validate the profile. The device name must be supported by
+the installed Bambu technology library.
+`--board` selects the device, target clock and regular-suite YAML together.
+The diagnostic suite keeps its explicit DDR3/DDR5/HBM2 probes and uses the
+selected board's clock. Both the full profile and actual case arguments are
+retained in the run metadata.
+
+`--compare-test NAME` reads all archived trials for that test and displays
+board, status, cycles, request counts, clock, config and timestamp. It shows
+individual trials so experiments with different parameters remain identifiable.
 
 ## Running Long Test Suites in Background (tmux)
 
@@ -112,15 +163,15 @@ the suite directory with `tmux` installed.
 ./run_tests.sh --all --tag ddr4-baseline --tmux
 ```
 
-The launcher starts `bambu_test_ddr4-baseline` in the background and returns
+The launcher starts `bambu_test_xcu250_ddr4-baseline` in the background and returns
 control to your shell. It keeps your working directory and exported environment,
 including `RAMULATOR2_DIR`, `LD_LIBRARY_PATH` and `PATH`, even if the tmux server
 was started before you activated the toolchain. From an existing tmux pane,
-`--tmux` runs the suite in that pane. The session suffix defaults to the suite
-name if you omit `--tag`. Dots in tags become underscores in session names.
+`--tmux` runs the suite in that pane. Session names include the board and tag.
+The tag defaults to the archive label or suite name. Dots in tags become underscores in session names.
 Use distinct session names for concurrent runs.
 
-To see the console, run `tmux attach -t bambu_test_ddr4-baseline`. Press
+To see the console, run `tmux attach -t bambu_test_xcu250_ddr4-baseline`. Press
 **Ctrl+b**, then **d** to detach. You can close SSH or your laptop after
 detaching. The session continues on the Ubuntu host as long as the host and
 tmux server stay up. Reconnect over SSH to the same host and run the attach
@@ -132,7 +183,7 @@ to follow the CSV as cases finish. With concurrent runs, use the specific
 `results/run_.../summary.csv` printed in the pane because `latest` follows the
 most recently started run. The corresponding files under `logs/` show output
 for cases still running. To stop a run launched with `--tmux`, use
-`tmux kill-session -t =bambu_test_ddr4-baseline`. Partial results are retained.
+`tmux kill-session -t =bambu_test_xcu250_ddr4-baseline`. Partial results are retained.
 
 ## Microbenchmarks
 
@@ -146,7 +197,7 @@ for cases still running. To stop a run launched with `--tmux`, use
 | T06 | Four volatile byte stores followed by a 32-bit load | `0x44332211` and preserved guard word on the i386 target |
 | T07 | Dependent sum alternating two locations, with near and 128 KiB offsets | Functional checks and latency comparison; verify the mapped bank and row before attributing a difference to conflicts |
 | T08 | Long sequential checksum | Execution window, tick count and refresh-related timing if command traces are available |
-| T09 | Same 64-byte-stride checksum with one and four YAML channels | Same output; compare model initialization, traffic and simulated cycles |
+| T09 | Same 64-byte-stride checksum with one and four Bambu interface channels | Same output; physical DRAM topology follows the board YAML |
 | T10 | Native-bus input and AXI output | Same transformed stream, and generated interfaces and aggregate ticks in retained evidence |
 
 These C patterns characterize the traffic Bambu actually synthesizes. Protocol
@@ -156,6 +207,10 @@ completions would require control beyond these C fixtures. Read-after-write
 verifies data visibility; MDPI can acknowledge writes before a DRAM command
 issues. The suite does not require T05 to overflow the controller or T08 to
 produce a calibrated refresh signature.
+
+New T09 runs vary Bambu interface channels. Earlier archived T09 runs selected
+per-case physical DRAM channel presets. Include the HLS flags and YAML hashes
+when grouping those experiments.
 
 ### Diagnostic presets
 
@@ -178,13 +233,14 @@ tag for each calibration sweep.
 
 - `metadata.json` records the run timestamp, suite Git commit and dirty state,
   host/user, configured and effective environment, Bambu and Verilator
-  version output, library SHA-256, pre-flight diagnostics, and case outcomes.
+  version output, library SHA-256, pre-flight diagnostics, case outcomes and
+  the complete `board_profile` object.
 - `config_snapshot/<test>/` contains the exact YAML, Bambu arguments as a JSON
   array, staged source and reference inputs, and hashes of the inputs and archive.
 - `logs/<test>.log` holds combined stdout/stderr. Beside it are any emitted
   result XML, cycle timing text and MachSuite output data. Generated RTL and
   other simulator artifacts remain in `work/<test>/` until explicitly cleaned.
-- `summary.csv` stores status, total accelerator cycles, wall time in seconds,
+- `summary.csv` starts with the `board` column, followed by status, total accelerator cycles, wall time in seconds,
   accepted read/write requests, and paths relative to the run. Retried requests
   count once when the controller accepts them. Write counts track acceptance.
   Read completions and tick totals are in the case metadata.
@@ -204,7 +260,8 @@ Cycle counts are measured outcomes for calibration and have no pass threshold.
 ```
 
 `--archive LABEL` publishes finished simulations, including failed cases, in
-`results/archive/YYYYMMDD_HHMMSS_LABEL/` (UTC). Use it with a simulation suite,
+`results/archive/<board>/run_YYYYMMDD_HHMMSS_<tag>/` (UTC). The tag defaults to
+the archive label. Use it with a simulation suite,
 optionally in tmux. Preflight failures and interrupted runs retain their local
 records. The archive contains only `metadata.json`, `summary.csv`,
 `config_snapshot/*.yaml` and `logs/*.log.gz`. Case metadata includes exact
@@ -217,8 +274,15 @@ run. Git can track the curated files and ignores ordinary runs and build outputs
 and writes one row per case, including its status. The default output is
 `results/dataset.csv`. Columns include run identity, YAML and input hashes,
 DRAM timing and topology, HLS options and `define_*` macros, and the observed
-cycles, wall time and request counts. `hls_flags` retains the complete argument
-array as JSON in one CSV column.
+cycles, wall time and request counts. Its first columns are `board`,
+`test_name`, `status`, `cycles`, `dram_reads`, `dram_writes`, `clock_ns`,
+`ramulator_config` and `timestamp`. The existing metric names remain available
+as additional columns. `hls_flags` retains the complete argument array as JSON
+in one CSV column.
+
+Export and comparison also read the earlier flat archive layout. For those
+records, the board is inferred from the stored device flag when available,
+otherwise it is reported as `unknown`.
 
 The exporter reads scalar YAML block mappings and JSON-formatted YAML. It
 resolves the timing presets shipped in `configs/` against the pinned Ramulator

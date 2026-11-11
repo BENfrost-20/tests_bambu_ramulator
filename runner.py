@@ -5,6 +5,7 @@ import datetime as dt
 import getpass
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import platform
@@ -20,7 +21,7 @@ import uuid
 import xml.etree.ElementTree as ET
 from zipfile import BadZipFile, ZipFile
 
-from dataset import export_dataset, publish_archive
+from dataset import compare_test, export_dataset, publish_archive
 from machsuite.cases import cases as machsuite_cases
 from polybench.cases import cases as polybench_cases
 
@@ -28,30 +29,68 @@ from polybench.cases import cases as polybench_cases
 ROOT = Path(__file__).resolve().parent
 RESULTS = ROOT / "results"
 BASELINE = ROOT / "environment_baseline.json"
+BOARDS = ROOT / "configs/boards.json"
 HLS_COMPILER = "I386_CLANG13"
-SMOKE = "default_ddr4.yaml"
-U250 = "xcu250_ddr4_2400R.yaml"
-PERIODS = {
-    SMOKE: "10", U250: "5", "xcu250_ddr4_2400R_1ch.yaml": "5",
-    "xcu250_ddr5_3200C.yaml": "3.75", "xcu250_ddr3_1600K.yaml": "7.5",
-    "xcu280_hbm2.yaml": "5",
-}
 COLUMNS = (
-    "test_name", "status", "total_sim_cycles", "wall_time_s", "dram_read_reqs",
+    "board", "test_name", "status", "total_sim_cycles", "wall_time_s", "dram_read_reqs",
     "dram_write_reqs", "yaml_config", "log_file",
 )
 COMMON = [
     "--simulate", "--simulator=VERILATOR", f"--compiler={HLS_COMPILER}", "-m32",
     "--generate-interface=INFER", "--memory-allocation-policy=NO_BRAM",
-    "--enable-ramulator-integrated", "--device-name=xcu250-2Lfigd2104",
+    "--enable-ramulator-integrated",
     "--output-directory=output", "-v5",
 ]
 ONE_CHANNEL = ["--channels-type=MEM_ACC_11", "--channels-number=1"]
 
 
-def smoke_case(name="smoke_vector_add", config=SMOKE):
+def load_board_profiles():
+    configured = json.loads(BOARDS.read_text(encoding="utf-8"))
+    if not isinstance(configured, list) or any(not isinstance(profile, dict) for profile in configured):
+        raise ValueError("configs/boards.json must contain a list of board profile objects")
+    profiles = {}
+    for profile in configured:
+        missing = {"name", "bambu_device", "default_clock_ns", "default_ramulator_yaml", "description"} - profile.keys()
+        if missing:
+            raise ValueError(f"Board profile is missing fields: {', '.join(sorted(missing))}")
+        name = profile["name"]
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name):
+            raise ValueError("Board names must use letters, digits, underscores or hyphens")
+        if name in profiles:
+            raise ValueError(f"Duplicate board profile {name}")
+        for field in ("bambu_device", "default_ramulator_yaml", "description"):
+            if not isinstance(profile[field], str) or not profile[field].strip():
+                raise ValueError(f"Board {name} requires {field}")
+        clock = profile["default_clock_ns"]
+        if isinstance(clock, bool) or not isinstance(clock, (int, float)) or not math.isfinite(clock) or clock <= 0:
+            raise ValueError(f"Board {name} requires a positive finite default_clock_ns")
+        if not (ROOT / profile["default_ramulator_yaml"]).is_file():
+            raise ValueError(f"Board {name} memory config is missing: {profile['default_ramulator_yaml']}")
+        profiles[name] = profile
+    if "xcu250" not in profiles:
+        raise ValueError("configs/boards.json must define the default xcu250 profile")
+    return profiles
+
+
+def board_profile(name):
+    profiles = load_board_profiles()
+    if name not in profiles:
+        raise ValueError(f"Unknown board {name}. Available boards: {', '.join(profiles)}")
+    return profiles[name]
+
+
+def list_boards():
+    print(f"{'BOARD':<12} {'STATUS':<14} {'BAMBU DEVICE':<24} {'CLOCK NS':>9}  RAMULATOR YAML")
+    for profile in load_board_profiles().values():
+        print(f"{profile['name']:<12} {profile.get('status', 'unspecified'):<14} {profile['bambu_device']:<24} "
+              f"{profile['default_clock_ns']:>9}  {profile['default_ramulator_yaml']}")
+        print(f"  {profile['description']}")
+
+
+def smoke_case(name="smoke_vector_add", diagnostic_config=None):
     return {
-        "name": name, "config": config, "members": ["smoke/vector_add_axi.c", "smoke/test_vector_add.xml"],
+        "name": name, "diagnostic_config": diagnostic_config,
+        "members": ["smoke/vector_add_axi.c", "smoke/test_vector_add.xml"],
         "limit": 100000,
         "flags": [
             "--top-fname=vector_add", "--generate-tb=@/smoke/test_vector_add.xml",
@@ -61,30 +100,32 @@ def smoke_case(name="smoke_vector_add", config=SMOKE):
 
 
 def micro_cases():
-    # Each tuple sets the synthesized pattern, array sizes, word stride and DRAM preset.
-    for name, pattern, words, outputs, stride, config in (
-        ("t01_clock", 1, 2, 1, 1, SMOKE),
-        ("t02_single_read", 2, 1, 1, 1, SMOKE),
-        ("t03_read_after_write", 3, 2, 1, 1, SMOKE),
-        ("t04_stream", 4, 512, 512, 1, SMOKE),
-        ("t05_queue_pressure", 5, 4096, 4096, 1, SMOKE),
-        ("t06_byte_lanes", 6, 2, 1, 1, SMOKE),
-        ("t07_row_local", 7, 32769, 1, 1, SMOKE),
-        ("t07_row_stride", 7, 32769, 1, 32768, SMOKE),
-        ("t08_refresh_stream", 8, 32768, 1, 1, SMOKE),
-        ("t09_channels_1", 9, 8192, 1, 16, "xcu250_ddr4_2400R_1ch.yaml"),
-        ("t09_channels_4", 9, 8192, 1, 16, U250),
-        ("t10_native_and_axi", 10, 512, 512, 1, U250),
+    # Channel variants change the HLS interface. Physical topology comes from the board YAML.
+    for name, pattern, words, outputs, stride in (
+        ("t01_clock", 1, 2, 1, 1),
+        ("t02_single_read", 2, 1, 1, 1),
+        ("t03_read_after_write", 3, 2, 1, 1),
+        ("t04_stream", 4, 512, 512, 1),
+        ("t05_queue_pressure", 5, 4096, 4096, 1),
+        ("t06_byte_lanes", 6, 2, 1, 1),
+        ("t07_row_local", 7, 32769, 1, 1),
+        ("t07_row_stride", 7, 32769, 1, 32768),
+        ("t08_refresh_stream", 8, 32768, 1, 1),
+        ("t09_channels_1", 9, 8192, 1, 16),
+        ("t09_channels_4", 9, 8192, 1, 16),
+        ("t10_native_and_axi", 10, 512, 512, 1),
     ):
+        channels = (["--channels-type=MEM_ACC_NN", "--channels-number=4"]
+                    if name == "t09_channels_4" else ONE_CHANNEL)
         yield {
-            "name": name, "config": config, "members": ["micro/pattern.c", "micro/check.c"],
+            "name": name, "members": ["micro/pattern.c", "micro/check.c"],
             "limit": 10000000, "marker": "MICRO CHECK PASS",
             "flags": [
                 "--top-fname=memory_pattern", "--generate-tb=@/micro/check.c", "@/micro/pattern.c",
                 f"-DPATTERN={pattern}", f"-DWORDS={words}", f"-DOUT_WORDS={outputs}", f"-DSTRIDE={stride}",
                 f"--tb-param-size=in:{4 * words},out:{4 * outputs}", "--std=gnu11",
                 "--tb-queue-size=64" if pattern == 5 else "--tb-queue-size=20",
-                "-fno-tree-vectorize", *ONE_CHANNEL, "--bus-pipelined",
+                "-fno-tree-vectorize", *channels, "--bus-pipelined",
             ],
         }
 
@@ -321,8 +362,12 @@ def environment_warnings(baseline, versions, distro):
     return warnings
 
 
-def stage_case(case, snapshot, config_override, bambu):
-    source_config = Path(config_override).resolve() if config_override else ROOT / "configs" / case.get("config", U250)
+def stage_case(case, snapshot, config_override, bambu, profile=None):
+    profile = profile or board_profile("xcu250")
+    default_config = ROOT / profile["default_ramulator_yaml"]
+    if case.get("diagnostic_config"):
+        default_config = ROOT / "configs" / case["diagnostic_config"]
+    source_config = Path(config_override).resolve() if config_override else default_config
     data = source_config.read_bytes()
     if b"!include" in data:
         raise ValueError("Use a self-contained YAML; Ramulator resolves !include relative to runtime paths")
@@ -347,12 +392,12 @@ def stage_case(case, snapshot, config_override, bambu):
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(ROOT / name, target)
     source_info["inputs_sha256"] = {name: sha256(inputs / name) for name in members}
-    period = os.environ.get("CLOCK_PERIOD_NS") or PERIODS.get(
-        source_config.name, PERIODS[case.get("config", U250)])
+    period = os.environ.get("CLOCK_PERIOD_NS") or str(profile["default_clock_ns"])
     if not re.fullmatch(r"(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)", period) or float(period) <= 0:
         raise ValueError("CLOCK_PERIOD_NS must be a positive decimal number")
     argv = [
-        bambu, *COMMON, f"--clock-period={period}", f"--max-sim-cycles={case.get('limit', 200000000)}",
+        bambu, *COMMON, f"--device-name={profile['bambu_device']}", f"--clock-period={period}",
+        f"--max-sim-cycles={case.get('limit', 200000000)}",
         *(flag.replace("@/", str(inputs) + "/") for flag in case["flags"]),
     ]
     write_json(snapshot / "bambu_flags.json", argv[1:])
@@ -468,7 +513,8 @@ def clean_work(run, dry_run):
     return removed
 
 
-def main(suite, tag, config, dry_run, archive_label=""):
+def main(suite, tag, config, dry_run, archive_label="", board="xcu250"):
+    profile = board_profile(board)
     now = dt.datetime.now(dt.timezone.utc)
     run = create_run(tag, now)
     print(f"Run directory: {run}", flush=True)
@@ -487,9 +533,10 @@ def main(suite, tag, config, dry_run, archive_label=""):
             preflight.append("CASE_TIMEOUT_S must be a positive integer")
         if any(ch.isspace() for ch in str(run)):
             preflight.append("The Bambu backend requires a workspace path without whitespace")
-    config_override = config or os.environ.get("RAMULATOR2_CONFIG", "")
+    config_override = config
     metadata = {
         "timestamp_utc": now.isoformat(), "suite": suite, "tag": tag, "dry_run": dry_run,
+        "board_profile": profile,
         "git_commit": capture(["git", "rev-parse", "HEAD"], ROOT)["output"],
         "git_status": capture(["git", "status", "--porcelain"], ROOT)["output"],
         "user": getpass.getuser(), "host": socket.gethostname(),
@@ -511,6 +558,7 @@ def main(suite, tag, config, dry_run, archive_label=""):
         name: sha256(ROOT / name) for name in
         ("run_tests.sh", "runner.py", "dataset.py", "polybench/cases.py", "machsuite/cases.py")
     }
+    metadata["boards_sha256"] = sha256(BOARDS)
     write_json(run / "metadata.json", metadata)
     for warning in warnings:
         print(f"\033[33m[WARNING]\033[0m {warning['component']} detected {warning['detected']} "
@@ -536,11 +584,11 @@ def main(suite, tag, config, dry_run, archive_label=""):
                 log = run / "logs" / f"{name}.log"
                 snapshot = run / "config_snapshot" / name
                 snapshot.mkdir()
-                row = dict(test_name=name, log_file=str(log.relative_to(run)))
+                row = dict(board=board, test_name=name, log_file=str(log.relative_to(run)))
                 details = {}
                 started = time.monotonic()
                 try:
-                    argv, yaml = stage_case(case, snapshot, config_override, paths["bambu"])
+                    argv, yaml = stage_case(case, snapshot, config_override, paths["bambu"], profile)
                     row["yaml_config"] = str(yaml.relative_to(run))
                     if dry_run:
                         log.write_text(f"RAMULATOR2_CONFIG={shlex.quote(str(yaml))}\n$ {shlex.join(argv)}\n",
@@ -596,13 +644,23 @@ if __name__ == "__main__":
     try:
         if sys.argv[1:] == ["--check-baseline"]:
             sys.exit(check_baseline_docs())
+        if sys.argv[1:] == ["--list-boards"]:
+            list_boards()
+            sys.exit(0)
+        if sys.argv[1] == "--validate-board":
+            board_profile(sys.argv[2])
+            sys.exit(0)
+        if sys.argv[1] == "--compare-test":
+            compare_test(RESULTS / "archive", sys.argv[2])
+            sys.exit(0)
         if sys.argv[1] == "--export-dataset":
             output = Path(sys.argv[2]) if len(sys.argv) > 2 else RESULTS / "dataset.csv"
             count = export_dataset(RESULTS / "archive", output)
             print(f"Exported {count} rows to {output.resolve()}")
             sys.exit(0)
         sys.exit(main(*sys.argv[1:4], dry_run=sys.argv[4] == "1",
-                      archive_label=sys.argv[5] if len(sys.argv) > 5 else ""))
+                      archive_label=sys.argv[5] if len(sys.argv) > 5 else "",
+                      board=sys.argv[6] if len(sys.argv) > 6 else "xcu250"))
     except (OSError, ValueError, KeyError) as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         sys.exit(1)

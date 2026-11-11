@@ -9,7 +9,7 @@ MemorySystem:
     impl: HBM2
     org:
       preset: HBM2_4Gb
-      channel: 8
+      channel: 32
     timing:
       preset: HBM2_2Gbps
 

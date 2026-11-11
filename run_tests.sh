@@ -4,8 +4,11 @@ set -euo pipefail
 usage() {
     cat <<'HELP'
 Usage: run_tests.sh [--smoke | --all | --suite NAME | --clean]
-                    [--config PATH] [--tag LABEL] [--archive LABEL] [--dry-run] [--tmux]
+                    [--board NAME] [--config PATH] [--tag LABEL] [--archive LABEL]
+                    [--dry-run] [--tmux]
+       run_tests.sh --list-boards
        run_tests.sh --export-dataset [output.csv]
+       run_tests.sh --compare-test TEST_NAME
        run_tests.sh --check-baseline
 Suites: smoke, micro, polybench, machsuite, diagnostic
 Default: --smoke. --all runs the four regular suites.
@@ -20,19 +23,25 @@ die() { printf '%s\n' "$*" >&2; exit 2; }
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 export PYTHONDONTWRITEBYTECODE=1
 case "${1:-}" in
-    --check-baseline|--export-dataset)
-        if [[ "$1" == --check-baseline ]]; then
-            [[ $# -eq 1 ]] || die "--check-baseline does not take arguments."
-        else
-            [[ $# -le 2 && "${2:-}" != --* ]] || die "--export-dataset takes at most one output path."
-        fi
+    --check-baseline|--list-boards|--export-dataset|--compare-test)
+        case "$1" in
+            --check-baseline|--list-boards)
+                [[ $# -eq 1 ]] || die "$1 does not take arguments."
+                ;;
+            --export-dataset)
+                [[ $# -le 2 && "${2:-}" != --* ]] || die "--export-dataset takes at most one output path."
+                ;;
+            --compare-test)
+                [[ $# -eq 2 && -n "$2" && "$2" != --* ]] || die "--compare-test requires one test name."
+                ;;
+        esac
         command -v python3 >/dev/null || die "python3 is required."
         exec python3 "$root/runner.py" "$@"
         ;;
 esac
 
 run_in_tmux() {
-    local session="bambu_test_${tag//./_}"
+    local session="bambu_test_${board}_${tag//./_}"
     local snapshot
     snapshot="$(mktemp "${TMPDIR:-/tmp}/bambu-tmux-env.XXXXXXXX")"
     trap 'rm -f -- "$snapshot"' EXIT
@@ -70,6 +79,7 @@ os.execve(script, [script, *(arg for arg in args if arg != b"--tmux")], env)
 
 original_args=("$@")
 suite=""
+board="xcu250"
 config=""
 tag=""
 archive=""
@@ -82,7 +92,7 @@ while [[ $# -gt 0 ]]; do
             suite="${1#--}"
             shift
             ;;
-        --suite|--config|--tag|--archive)
+        --suite|--board|--config|--tag|--archive)
             [[ $# -ge 2 && -n "$2" && "$2" != --* ]] || die "$1 requires a value."
             case "$1" in
                 --suite)
@@ -93,6 +103,7 @@ while [[ $# -gt 0 ]]; do
                     esac
                     ;;
                 --config) config="$2" ;;
+                --board) board="$2" ;;
                 --tag) tag="$2" ;;
                 --archive) archive="$2" ;;
             esac
@@ -114,6 +125,8 @@ if [[ -n "$archive" ]]; then
 fi
 [[ "$suite" != clean || -z "$config" ]] || die "--clean does not take --config."
 command -v python3 >/dev/null || die "python3 is required."
+# Validate the profile before creating a detached session.
+python3 "$root/runner.py" --validate-board "$board"
 if (( detach )); then
     if [[ -n "${TMUX:-}" ]]; then
         printf 'Already inside tmux. Running in this pane.\n'
@@ -123,4 +136,4 @@ if (( detach )); then
         exit 0
     fi
 fi
-exec python3 "$root/runner.py" "$suite" "$tag" "$config" "$dry_run" "$archive"
+exec python3 "$root/runner.py" "$suite" "$tag" "$config" "$dry_run" "$archive" "$board"
