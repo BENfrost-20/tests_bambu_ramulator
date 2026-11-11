@@ -121,7 +121,7 @@ is `xcu250`.
 
 | Board | Bambu device | Clock (ns) | Memory config | Status |
 |---|---|---:|---|---|
-| `xcu250` | `xcu250-figd2104-2L-e` | 5.0 | `configs/xcu250_ddr4_2400R.yaml`, DDR4, 4 channels | stable |
+| `xcu250` | `xcu280-2Lfsvh2892` | 5.0 | `configs/xcu250_ddr4_2400R.yaml`, DDR4, 4 channels | stable |
 | `xcu280` | `xcu280-2Lfsvh2892` | 4.0 | `configs/xcu280_hbm2.yaml`, HBM2, 32 channels | experimental |
 | `xcu55c` | `xcu55c-2Lfsvh2892` | 3.33 | `configs/xcu280_hbm2.yaml`, HBM2e target, 32 channels | experimental |
 
