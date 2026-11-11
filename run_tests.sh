@@ -5,14 +5,16 @@ usage() {
     cat <<'HELP'
 Usage: run_tests.sh [--smoke | --all | --suite NAME | --clean]
                     [--board NAME] [--config PATH] [--tag LABEL] [--archive LABEL]
-                    [--dry-run] [--tmux]
+                    [--dry-run] [--tmux] [--keep-work]
+       run_tests.sh --clean-work [--older-than-days N] [--dry-run]
        run_tests.sh --list-boards
        run_tests.sh --export-dataset [output.csv]
        run_tests.sh --compare-test TEST_NAME
        run_tests.sh --check-baseline
 Suites: smoke, micro, polybench, machsuite, diagnostic
 Default: --smoke. --all runs the four regular suites.
---clean removes work directories from finished runs and preserves evidence.
+--clean removes finished PASS work with saved evidence.
+--keep-work preserves work directories for manual inspection.
 --tmux starts a detached session, or runs inline from an existing tmux pane.
 --archive publishes curated telemetry and removes temporary build artifacts.
 HELP
@@ -23,7 +25,7 @@ die() { printf '%s\n' "$*" >&2; exit 2; }
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 export PYTHONDONTWRITEBYTECODE=1
 case "${1:-}" in
-    --check-baseline|--list-boards|--export-dataset|--compare-test)
+    --check-baseline|--list-boards|--export-dataset|--compare-test|--clean-work)
         case "$1" in
             --check-baseline|--list-boards)
                 [[ $# -eq 1 ]] || die "$1 does not take arguments."
@@ -34,6 +36,7 @@ case "${1:-}" in
             --compare-test)
                 [[ $# -eq 2 && -n "$2" && "$2" != --* ]] || die "--compare-test requires one test name."
                 ;;
+            --clean-work) ;; # The Python maintenance parser validates its options.
         esac
         command -v python3 >/dev/null || die "python3 is required."
         exec python3 "$root/runner.py" "$@"
@@ -85,6 +88,7 @@ tag=""
 archive=""
 dry_run=0
 detach=0
+keep_work=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --smoke|--all|--clean)
@@ -111,6 +115,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         --dry-run) dry_run=1; shift ;;
         --tmux) detach=1; shift ;;
+        --keep-work) keep_work=1; shift ;;
         --help|-h) usage; exit 0 ;;
         *) die "Unknown option: $1" ;;
     esac
@@ -124,7 +129,22 @@ if [[ -n "$archive" ]]; then
     [[ "$suite" != clean && "$dry_run" -eq 0 ]] || die "--archive requires a simulation suite without --dry-run."
 fi
 [[ "$suite" != clean || -z "$config" ]] || die "--clean does not take --config."
-command -v python3 >/dev/null || die "python3 is required."
+if [[ "$suite" != clean ]]; then
+    if [[ -z "${BAMBU_HLS:-}" || -z "${RAMULATOR2_DIR:-}" ]]; then
+        if [[ -f "$root/env.sh" ]]; then
+            set -a
+            source "$root/env.sh"
+            set +a
+            IFS=$' \t\n'
+            export BAMBU_LOCAL_ENV_FILE="$root/env.sh"
+            printf '[INFO] Loaded environment from local env.sh\n'
+        fi
+        if [[ -z "${BAMBU_HLS:-}" || -z "${RAMULATOR2_DIR:-}" ]]; then
+            printf '[INFO] Configure the required variables by copying env.example.sh to env.sh in %s.\n' "$root" >&2
+        fi
+    fi
+fi
+command -v python3 >/dev/null || die "python3 is required. Check PATH in env.example.sh."
 # Validate the profile before creating a detached session.
 python3 "$root/runner.py" --validate-board "$board"
 if (( detach )); then
@@ -136,4 +156,4 @@ if (( detach )); then
         exit 0
     fi
 fi
-exec python3 "$root/runner.py" "$suite" "$tag" "$config" "$dry_run" "$archive" "$board"
+exec python3 "$root/runner.py" "$suite" "$tag" "$config" "$dry_run" "$archive" "$board" "$keep_work"

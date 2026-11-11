@@ -44,8 +44,24 @@ Run `./run_tests.sh --check-baseline` after changing the baseline or this table.
 
 ## Environment and execution
 
+Copy [env.example.sh](env.example.sh) to the Git-ignored `env.sh` and edit the
+installed tool paths once.
+
+```bash
+cp env.example.sh env.sh
+# Edit env.sh with this host's installation paths.
+./run_tests.sh --smoke
+```
+
+When `BAMBU_HLS` or `RAMULATOR2_DIR` is missing, the runner sources the local
+`env.sh` before preflight and prints `[INFO] Loaded environment from local env.sh`.
+An already configured shell supplies its existing environment. Missing variables
+still produce the standard preflight errors, with a pointer to the template.
+Run metadata records the loaded file's path and SHA-256, the active `PATH` and
+the configured library/header paths.
+
 From Bash on the installed Linux host, use the appropriate local prefixes.
-These examples use the recorded server layout.
+The equivalent manual setup below uses the recorded server layout.
 
 ```bash
 source "$HOME/thesis/toolchains/settings.sh"
@@ -101,9 +117,8 @@ applies to `--dry-run`. `--clean` can run without the simulation toolchain.
   private working directory, IPC filename, temporary directory and process
   group per case. `--dry-run` stages inputs and commands without synthesis
   or simulation. Tool probes are recorded and successful plans produce a
-  header-only CSV. `--clean` removes intermediate `work/` directories
-  from completed runs and preserves run metadata, snapshots, logs and
-  retained result XML. Each of these commands creates its own run record.
+  header-only CSV. `--keep-work` disables automatic workspace pruning.
+  Each simulation command creates its own run record.
 
 ## Board profiles and comparisons
 
@@ -238,8 +253,8 @@ tag for each calibration sweep.
 - `config_snapshot/<test>/` contains the exact YAML, Bambu arguments as a JSON
   array, staged source and reference inputs, and hashes of the inputs and archive.
 - `logs/<test>.log` holds combined stdout/stderr. Beside it are any emitted
-  result XML, cycle timing text and MachSuite output data. Generated RTL and
-  other simulator artifacts remain in `work/<test>/` until explicitly cleaned.
+  result XML, cycle timing text and MachSuite output data. Once the case
+  finishes, the log becomes `logs/<test>.log.gz` and the CSV points to it.
 - `summary.csv` starts with the `board` column, followed by status, total accelerator cycles, wall time in seconds,
   accepted read/write requests, and paths relative to the run. Retried requests
   count once when the controller accepts them. Write counts track acceptance.
@@ -251,6 +266,37 @@ and an accepted Ramulator read with a completion under the recorded YAML.
 simulation. `ERROR` covers missing dependencies, setup failures, timeouts and
 incomplete result XML. A completed suite exits 1 if any case fails or errors.
 Cycle counts are measured outcomes for calibration and have no pass threshold.
+
+### Workspace retention and maintenance
+
+After a `PASS`, the runner saves metrics, XML, metadata, YAML snapshots and the
+compressed combined log before pruning generated artifacts. It removes the
+Verilator backend's compiled work files, object files and uncompressed wave
+dumps such as `.vcd` and `.fst`. Workspace logs become `.log.gz`, and XML,
+YAML and other evidence files remain available. `ERROR` and `FAIL` cases
+retain their full work tree for debugging.
+
+```bash
+./run_tests.sh --smoke --keep-work
+./run_tests.sh --all --archive inspect-rtl --keep-work
+./run_tests.sh --clean-work --dry-run
+./run_tests.sh --clean-work --older-than-days 14
+```
+
+`--keep-work` protects the workspace even with `--archive`. The combined log
+outside that workspace is still compressed. The retention setting and cleanup
+outcome are recorded in `metadata.json`.
+
+`--clean-work` defaults to a minimum age of **7 days** and runs without the
+simulation toolchain. It scans `results/work/` and ordinary run work directories.
+Old passing work with saved logs, XML and snapshots can be removed completely.
+Additional workspace logs, XML, YAML and JSON are saved under
+`logs/<test>.artifacts/` before that removal.
+For orphaned work, it prunes recognized generated files and retains evidence.
+Active runs and simulator process groups, failed cases, `--keep-work` runs and
+symlinks are skipped. Archives, run metadata, CSV summaries and configuration
+snapshots are retained. `--clean` applies the same safeguards to completed
+runs without an age limit.
 
 ### Archive an experiment
 
@@ -265,10 +311,13 @@ the archive label. Use it with a simulation suite,
 optionally in tmux. Preflight failures and interrupted runs retain their local
 records. The archive contains only `metadata.json`, `summary.csv`,
 `config_snapshot/*.yaml` and `logs/*.log.gz`. Case metadata includes exact
-Bambu arguments and source/input hashes. Once publication succeeds, the runner
-removes the temporary work tree and uncompressed logs. The local summary
+Bambu arguments and source/input hashes. Publication preserves the per-case
+workspace retention policy, including error work and `--keep-work`. The local summary
 references the compressed logs, and `results/latest` still points at the local
-run. Git can track the curated files and ignores ordinary runs and build outputs.
+run. Under `results/`, Git can track `metadata.json`, `summary.csv` and exported
+CSV datasets such as `cross-board.csv`. Raw logs, compressed log archives,
+configuration snapshots and temporary work are ignored. The full on-disk
+archive retains the execution evidence for local inspection.
 
 `--export-dataset [output.csv]` reads the archives without running preflight
 and writes one row per case, including its status. The default output is

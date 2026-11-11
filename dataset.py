@@ -95,9 +95,13 @@ def publish_archive(run, label, timestamp):
             if row["log_file"]:
                 log = run / row["log_file"]
                 archived["log_file"] = f"logs/{name}.log.gz"
-                with log.open("rb") as source, (pending / archived["log_file"]).open("wb") as output:
-                    with gzip.GzipFile(filename="", mode="wb", fileobj=output, mtime=0) as compressed:
-                        shutil.copyfileobj(source, compressed)
+                destination = pending / archived["log_file"]
+                if log.suffix == ".gz":
+                    shutil.copyfile(log, destination)
+                else:
+                    with log.open("rb") as source, destination.open("wb") as output:
+                        with gzip.GzipFile(filename="", mode="wb", fileobj=output, mtime=0) as compressed:
+                            shutil.copyfileobj(source, compressed)
                 logs.append((log, row, archived["log_file"]))
             curated.append(archived)
         write_csv(pending / "summary.csv", columns, curated)
@@ -117,15 +121,13 @@ def publish_archive(run, label, timestamp):
         else:
             raise ValueError(f"Could not allocate an archive directory for {prefix}")
 
-    # Keep latest and the local CSV usable while releasing raw logs and build trees.
+    # Keep latest usable and leave workspace retention to the runner's case policy.
     for _, row, compressed_path in logs:
         row["log_file"] = str(Path("..") / archive.relative_to(run.parent) / compressed_path)
     write_csv(run / "summary.csv", columns, rows)
     for log, _, _ in logs:
-        log.unlink()
-    work = run / "work"
-    if work.is_dir():
-        shutil.rmtree(work)
+        if log.parent.resolve() == (run / "logs").resolve():
+            log.unlink()
     return archive
 
 

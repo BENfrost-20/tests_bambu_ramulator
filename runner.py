@@ -22,6 +22,7 @@ import xml.etree.ElementTree as ET
 from zipfile import BadZipFile, ZipFile
 
 from dataset import compare_test, export_dataset, publish_archive
+from workspace import clean_stale_work, compress_log, maintenance_cli, prune_work, work_lock
 from machsuite.cases import cases as machsuite_cases
 from polybench.cases import cases as polybench_cases
 
@@ -217,7 +218,7 @@ def inspect_host():
         errors.append("I386_CLANG13 co-simulation requires the Linux x86_64 multilib host")
     for name in ("BAMBU_HLS", "BAMBU_HLS_BACKEND_PATH", "RAMULATOR2_DIR"):
         if not os.environ.get(name):
-            errors.append(f"{name} is unset")
+            errors.append(f"{name} is unset (copy env.example.sh to env.sh and configure it)")
     if os.environ.get("BAMBU_HLS"):
         makefile = Path(os.environ["BAMBU_HLS"]) / "share/panda/libmdpi/Makefile.mk"
         if not makefile.is_file():
@@ -412,9 +413,11 @@ def launch(argv, work, log, env, timeout):
         handle.flush()
         with subprocess.Popen(argv, cwd=work, env=env, stdout=handle, stderr=subprocess.STDOUT,
                               start_new_session=True) as process:
+            marker = work / ".process.json"
             try:
+                write_json(marker, {"pgid": process.pid, "host": socket.gethostname()})
                 return process.wait(timeout=timeout)
-            except (subprocess.TimeoutExpired, KeyboardInterrupt) as exc:
+            except (subprocess.TimeoutExpired, KeyboardInterrupt, OSError) as exc:
                 with suppress(ProcessLookupError):
                     os.killpg(process.pid, signal.SIGTERM)
                 with suppress(subprocess.TimeoutExpired):
@@ -422,10 +425,14 @@ def launch(argv, work, log, env, timeout):
                 with suppress(ProcessLookupError):
                     os.killpg(process.pid, signal.SIGKILL)
                 process.wait()
-                if isinstance(exc, KeyboardInterrupt):
+                if isinstance(exc, (KeyboardInterrupt, OSError)):
                     raise
                 handle.write(f"\nRUNNER: wall timeout after {timeout:g}s\n")
                 return None
+            finally:
+                if process.poll() is not None:
+                    with suppress(OSError):
+                        marker.unlink(missing_ok=True)
 
 
 def measure(log):
@@ -500,138 +507,153 @@ def assess(case, row, log, work, yaml, exit_code):
 
 
 def clean_work(run, dry_run):
-    removed = []
-    for old in sorted(RESULTS.glob("run_*")):
-        if old == run or old.is_symlink() or not (old / ".complete").is_file():
-            continue
-        work = old / "work"
-        if work.is_dir() and not work.is_symlink():
-            removed.append(str(work.relative_to(RESULTS)))
-            if not dry_run:
-                with suppress(FileNotFoundError):
-                    shutil.rmtree(work)
-    return removed
+    return [action["path"] for action in clean_stale_work(RESULTS, 0, dry_run, completed_only=True)]
 
 
-def main(suite, tag, config, dry_run, archive_label="", board="xcu250"):
+def main(suite, tag, config, dry_run, archive_label="", board="xcu250", keep_work=False):
     profile = board_profile(board)
     now = dt.datetime.now(dt.timezone.utc)
     run = create_run(tag, now)
-    print(f"Run directory: {run}", flush=True)
-    paths, versions, env, library, preflight = {}, {}, os.environ.copy(), None, []
-    baseline, distro, warnings = None, {}, []
-    timeout_text = os.environ.get("CASE_TIMEOUT_S", "2700")
-    if suite != "clean":
-        paths, versions, env, library, preflight = inspect_host()
-        distro = read_os_release()
-        try:
-            baseline = json.loads(BASELINE.read_text(encoding="utf-8"))
-            warnings = environment_warnings(baseline, versions, distro)
-        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
-            preflight.append(f"Invalid environment baseline {BASELINE}: {exc}")
-        if not re.fullmatch(r"[1-9][0-9]*", timeout_text):
-            preflight.append("CASE_TIMEOUT_S must be a positive integer")
-        if any(ch.isspace() for ch in str(run)):
-            preflight.append("The Bambu backend requires a workspace path without whitespace")
-    config_override = config
-    metadata = {
-        "timestamp_utc": now.isoformat(), "suite": suite, "tag": tag, "dry_run": dry_run,
-        "board_profile": profile,
-        "git_commit": capture(["git", "rev-parse", "HEAD"], ROOT)["output"],
-        "git_status": capture(["git", "status", "--porcelain"], ROOT)["output"],
-        "user": getpass.getuser(), "host": socket.gethostname(),
-        "os": platform.platform(), "os_release": distro, "architecture": platform.machine(),
-        "environment": {key: os.environ.get(key) for key in (
-            "BAMBU_HLS", "BAMBU_HLS_BACKEND_PATH", "RAMULATOR2_DIR", "RAMULATOR2_CONFIG",
-            "RAMULATOR_OVERRIDE_CHANNELS", "LD_LIBRARY_PATH", "CPLUS_INCLUDE_PATH",
-            "BENCHMARK_ARCHIVES", "CLOCK_PERIOD_NS", "CASE_TIMEOUT_S",
-        )},
-        "effective_environment": {key: env.get(key) for key in (
-            "RAMULATOR2_DIR", "LD_LIBRARY_PATH", "CPLUS_INCLUDE_PATH", "RAMULATOR_OVERRIDE_CHANNELS",
-        )},
-        "config_override": str(Path(config_override).resolve()) if config_override else None,
-        "tool_paths": paths, "tool_versions": versions, "ramulator_library": library,
-        "environment_baseline": baseline, "environment_warnings": warnings,
-        "preflight_errors": preflight, "cases": {},
-    }
-    metadata["runner_sha256"] = {
-        name: sha256(ROOT / name) for name in
-        ("run_tests.sh", "runner.py", "dataset.py", "polybench/cases.py", "machsuite/cases.py")
-    }
-    metadata["boards_sha256"] = sha256(BOARDS)
-    write_json(run / "metadata.json", metadata)
-    for warning in warnings:
-        print(f"\033[33m[WARNING]\033[0m {warning['component']} detected {warning['detected']} "
-              f"(expected {warning['expected']})", flush=True)
-    failed = False
-    with (run / "summary.csv").open("w", newline="", encoding="utf-8") as output:
-        writer = csv.DictWriter(output, COLUMNS)
-        writer.writeheader()
-        output.flush()
-        if suite == "clean":
-            removed = clean_work(run, dry_run)
-            verb = "Would remove" if dry_run else "Removed"
-            metadata["clean_work_directories"] = removed
-            print(f"{verb} {len(removed)} finished work directories.")
-        elif preflight:
-            for error in preflight:
-                print(f"[ERROR] Pre-flight: {error}", file=sys.stderr)
-            failed = True
-        else:
-            print(f"{'TEST':<25} {'STATUS':<7} {'CYCLES':>11} {'WALL S':>8} {'READS':>9} {'WRITES':>9}", flush=True)
-            for case in select_cases(suite):
-                name = case["name"]
-                log = run / "logs" / f"{name}.log"
-                snapshot = run / "config_snapshot" / name
-                snapshot.mkdir()
-                row = dict(board=board, test_name=name, log_file=str(log.relative_to(run)))
-                details = {}
-                started = time.monotonic()
-                try:
-                    argv, yaml = stage_case(case, snapshot, config_override, paths["bambu"], profile)
-                    row["yaml_config"] = str(yaml.relative_to(run))
-                    if dry_run:
-                        log.write_text(f"RAMULATOR2_CONFIG={shlex.quote(str(yaml))}\n$ {shlex.join(argv)}\n",
-                                       encoding="utf-8")
-                        print(f"{name:<25} PLANNED", flush=True)
-                        metadata["cases"][name] = {"planned": True, "yaml_config": str(yaml)}
-                        continue
-                    work = run / "work" / name
-                    (work / "tmp").mkdir(parents=True)
-                    case_env = dict(env, RAMULATOR2_CONFIG=str(yaml), TMPDIR=str(work / "tmp"),
-                                    BAMBU_IPC_FILENAME=str(work / "panda_ipc_mmap"))
-                    started = time.monotonic()
-                    exit_code = launch(argv, work, log, case_env, int(timeout_text))
-                    row["wall_time_s"] = f"{time.monotonic() - started:.3f}"
-                    for artifact in ("output/bambu_results.xml", "output/bambu_time_simulation.txt", "output.data"):
-                        source = work / artifact
-                        if source.is_file():
-                            shutil.copyfile(source, log.with_suffix(f".{source.name}"))
-                    status, reason, details = assess(case, row, log, work, yaml, exit_code)
-                except (OSError, ValueError, KeyError, BadZipFile) as exc:
-                    status, reason = "ERROR", str(exc)
-                row["status"] = status
-                if not dry_run:
-                    row.setdefault("wall_time_s", f"{time.monotonic() - started:.3f}")
-                with log.open("a", encoding="utf-8") as handle:
-                    handle.write(f"\nRUNNER: {status}: {reason}\n")
-                writer.writerow(row)
-                output.flush()
-                metadata["cases"][name] = dict(details, status=status, reason=reason,
-                                               yaml_config=row.get("yaml_config"))
-                write_json(run / "metadata.json", metadata)
-                failed |= status != "PASS"
-                print(f"{name:<25} {status:<7} {str(row.get('total_sim_cycles', '-')):>11} "
-                      f"{row.get('wall_time_s', '-'):>8} {str(row.get('dram_read_reqs', '-')):>9} "
-                      f"{str(row.get('dram_write_reqs', '-')):>9}", flush=True)
-    write_json(run / "metadata.json", metadata)
-    if archive_label and not preflight:
-        archive = publish_archive(run, archive_label, now.strftime("%Y%m%d_%H%M%S"))
-        metadata["archive_directory"] = str(archive.relative_to(RESULTS))
+    with work_lock(run) as locked:
+        if not locked:
+            raise ValueError(f"Cannot lock run directory {run}")
+        print(f"Run directory: {run}", flush=True)
+        paths, versions, env, library, preflight = {}, {}, os.environ.copy(), None, []
+        baseline, distro, warnings = None, {}, []
+        timeout_text = os.environ.get("CASE_TIMEOUT_S", "2700")
+        if suite != "clean":
+            paths, versions, env, library, preflight = inspect_host()
+            distro = read_os_release()
+            try:
+                baseline = json.loads(BASELINE.read_text(encoding="utf-8"))
+                warnings = environment_warnings(baseline, versions, distro)
+            except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+                preflight.append(f"Invalid environment baseline {BASELINE}: {exc}")
+            if not re.fullmatch(r"[1-9][0-9]*", timeout_text):
+                preflight.append("CASE_TIMEOUT_S must be a positive integer")
+            if any(ch.isspace() for ch in str(run)):
+                preflight.append("The Bambu backend requires a workspace path without whitespace")
+        config_override = config
+        metadata = {
+            "timestamp_utc": now.isoformat(), "suite": suite, "tag": tag, "dry_run": dry_run,
+            "board_profile": profile, "keep_work": keep_work,
+            "git_commit": capture(["git", "rev-parse", "HEAD"], ROOT)["output"],
+            "git_status": capture(["git", "status", "--porcelain"], ROOT)["output"],
+            "user": getpass.getuser(), "host": socket.gethostname(),
+            "os": platform.platform(), "os_release": distro, "architecture": platform.machine(),
+            "environment": {key: os.environ.get(key) for key in (
+                "BAMBU_HLS", "BAMBU_HLS_BACKEND_PATH", "RAMULATOR2_DIR", "RAMULATOR2_CONFIG",
+                "RAMULATOR_OVERRIDE_CHANNELS", "LD_LIBRARY_PATH", "CPLUS_INCLUDE_PATH",
+                "BENCHMARK_ARCHIVES", "CLOCK_PERIOD_NS", "CASE_TIMEOUT_S", "PATH",
+            )},
+            "effective_environment": {key: env.get(key) for key in (
+                "RAMULATOR2_DIR", "LD_LIBRARY_PATH", "CPLUS_INCLUDE_PATH", "RAMULATOR_OVERRIDE_CHANNELS",
+            )},
+            "config_override": str(Path(config_override).resolve()) if config_override else None,
+            "tool_paths": paths, "tool_versions": versions, "ramulator_library": library,
+            "environment_baseline": baseline, "environment_warnings": warnings,
+            "preflight_errors": preflight, "cases": {},
+        }
+        metadata["runner_sha256"] = {
+            name: sha256(ROOT / name) for name in
+            ("run_tests.sh", "runner.py", "dataset.py", "workspace.py", "polybench/cases.py", "machsuite/cases.py")
+        }
+        local_env = os.environ.get("BAMBU_LOCAL_ENV_FILE")
+        metadata["local_environment"] = {
+            "path": local_env, "sha256": sha256(Path(local_env)) if Path(local_env).is_file() else None,
+        } if local_env else None
+        metadata["boards_sha256"] = sha256(BOARDS)
         write_json(run / "metadata.json", metadata)
-        print(f"Archived experiment: {archive}", flush=True)
-    (run / ".complete").touch()
-    return int(failed)
+        for warning in warnings:
+            print(f"\033[33m[WARNING]\033[0m {warning['component']} detected {warning['detected']} "
+                  f"(expected {warning['expected']})", flush=True)
+        failed = False
+        with (run / "summary.csv").open("w", newline="", encoding="utf-8") as output:
+            writer = csv.DictWriter(output, COLUMNS)
+            writer.writeheader()
+            output.flush()
+            if suite == "clean":
+                removed = clean_work(run, dry_run)
+                verb = "Would remove" if dry_run else "Removed"
+                metadata["clean_work_directories"] = removed
+                print(f"{verb} {len(removed)} finished work directories.")
+            elif preflight:
+                for error in preflight:
+                    print(f"[ERROR] Pre-flight: {error}", file=sys.stderr)
+                failed = True
+            else:
+                print(f"{'TEST':<25} {'STATUS':<7} {'CYCLES':>11} {'WALL S':>8} {'READS':>9} {'WRITES':>9}", flush=True)
+                for case in select_cases(suite):
+                    name = case["name"]
+                    log = run / "logs" / f"{name}.log"
+                    snapshot = run / "config_snapshot" / name
+                    snapshot.mkdir()
+                    row = dict(board=board, test_name=name, log_file=str(log.relative_to(run)))
+                    details = {}
+                    started = time.monotonic()
+                    try:
+                        argv, yaml = stage_case(case, snapshot, config_override, paths["bambu"], profile)
+                        row["yaml_config"] = str(yaml.relative_to(run))
+                        if dry_run:
+                            log.write_text(f"RAMULATOR2_CONFIG={shlex.quote(str(yaml))}\n$ {shlex.join(argv)}\n",
+                                           encoding="utf-8")
+                            print(f"{name:<25} PLANNED", flush=True)
+                            metadata["cases"][name] = {"planned": True, "yaml_config": str(yaml)}
+                            continue
+                        work = run / "work" / name
+                        (work / "tmp").mkdir(parents=True)
+                        case_env = dict(env, RAMULATOR2_CONFIG=str(yaml), TMPDIR=str(work / "tmp"),
+                                        BAMBU_IPC_FILENAME=str(work / "panda_ipc_mmap"))
+                        started = time.monotonic()
+                        exit_code = launch(argv, work, log, case_env, int(timeout_text))
+                        row["wall_time_s"] = f"{time.monotonic() - started:.3f}"
+                        for artifact in ("output/bambu_results.xml", "output/bambu_time_simulation.txt", "output.data"):
+                            source = work / artifact
+                            if source.is_file():
+                                shutil.copyfile(source, log.with_suffix(f".{source.name}"))
+                        status, reason, details = assess(case, row, log, work, yaml, exit_code)
+                    except (OSError, ValueError, KeyError, BadZipFile) as exc:
+                        status, reason = "ERROR", str(exc)
+                    row["status"] = status
+                    if not dry_run:
+                        row.setdefault("wall_time_s", f"{time.monotonic() - started:.3f}")
+                    with log.open("a", encoding="utf-8") as handle:
+                        handle.write(f"\nRUNNER: {status}: {reason}\n")
+                    compressed = None
+                    if not dry_run:
+                        try:
+                            compressed = compress_log(log)
+                            row["log_file"] = str(compressed.relative_to(run))
+                        except OSError as exc:
+                            details["cleanup_warning"] = f"Log compression failed: {exc}"
+                    writer.writerow(row)
+                    output.flush()
+                    os.fsync(output.fileno())
+                    metadata["cases"][name] = dict(details, status=status, reason=reason,
+                                                   yaml_config=row.get("yaml_config"), log_file=row["log_file"])
+                    write_json(run / "metadata.json", metadata)
+                    if compressed:
+                        try:
+                            log.unlink()
+                            if status == "PASS" and not keep_work:
+                                metadata["cases"][name]["work_cleanup"] = prune_work(run / "work" / name)
+                        except OSError as exc:
+                            metadata["cases"][name]["cleanup_warning"] = str(exc)
+                        write_json(run / "metadata.json", metadata)
+                    if metadata["cases"][name].get("cleanup_warning"):
+                        print(f"[WARNING] {name} cleanup: {metadata['cases'][name]['cleanup_warning']}", file=sys.stderr)
+                    failed |= status != "PASS"
+                    print(f"{name:<25} {status:<7} {str(row.get('total_sim_cycles', '-')):>11} "
+                          f"{row.get('wall_time_s', '-'):>8} {str(row.get('dram_read_reqs', '-')):>9} "
+                          f"{str(row.get('dram_write_reqs', '-')):>9}", flush=True)
+        write_json(run / "metadata.json", metadata)
+        if archive_label and not preflight:
+            archive = publish_archive(run, archive_label, now.strftime("%Y%m%d_%H%M%S"))
+            metadata["archive_directory"] = str(archive.relative_to(RESULTS))
+            write_json(run / "metadata.json", metadata)
+            print(f"Archived experiment: {archive}", flush=True)
+        (run / ".complete").touch()
+        return int(failed)
 
 
 def interrupt(_signal, _frame):
@@ -647,6 +669,9 @@ if __name__ == "__main__":
         if sys.argv[1:] == ["--list-boards"]:
             list_boards()
             sys.exit(0)
+        if sys.argv[1] == "--clean-work":
+            maintenance_cli(RESULTS, sys.argv[2:])
+            sys.exit(0)
         if sys.argv[1] == "--validate-board":
             board_profile(sys.argv[2])
             sys.exit(0)
@@ -660,7 +685,8 @@ if __name__ == "__main__":
             sys.exit(0)
         sys.exit(main(*sys.argv[1:4], dry_run=sys.argv[4] == "1",
                       archive_label=sys.argv[5] if len(sys.argv) > 5 else "",
-                      board=sys.argv[6] if len(sys.argv) > 6 else "xcu250"))
+                      board=sys.argv[6] if len(sys.argv) > 6 else "xcu250",
+                      keep_work=len(sys.argv) > 7 and sys.argv[7] == "1"))
     except (OSError, ValueError, KeyError) as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         sys.exit(1)

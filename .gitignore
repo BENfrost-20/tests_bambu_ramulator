@@ -1,23 +1,20 @@
-/results/*
-!/results/archive/
-/results/archive/**
-!/results/archive/*/
-!/results/archive/*/config_snapshot/
-!/results/archive/*/logs/
-!/results/archive/*/run_*/
-!/results/archive/*/metadata.json
-!/results/archive/*/summary.csv
-!/results/archive/*/config_snapshot/*.yaml
-!/results/archive/*/logs/*.log.gz
-!/results/archive/*/run_*/metadata.json
-!/results/archive/*/run_*/summary.csv
-!/results/archive/*/run_*/config_snapshot/
-!/results/archive/*/run_*/config_snapshot/*.yaml
-!/results/archive/*/run_*/logs/
-!/results/archive/*/run_*/logs/*.log.gz
-/results/archive/**/.*/
+# Track numerical experiment records and datasets under results.
+/results/**
+!/results/**/
+!/results/**/metadata.json
+!/results/**/summary.csv
+!/results/**/*.csv
+
+# Keep execution evidence, snapshots and temporary work local.
+/results/**/logs/
+/results/**/work/
+/results/**/config_snapshot/
+/results/**/.*/
+*.log
+*.log.gz
 
 __pycache__/
+/env.sh
 build/
 bambu_results/
 HLS_output/
