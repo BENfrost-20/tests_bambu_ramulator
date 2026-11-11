@@ -21,8 +21,8 @@ import uuid
 import xml.etree.ElementTree as ET
 from zipfile import BadZipFile, ZipFile
 
-from dataset import compare_test, export_dataset, publish_archive
-from workspace import clean_stale_work, compress_log, maintenance_cli, prune_work, work_lock
+from dataset import compare_test, export_dataset, export_summary, publish_archive
+from workspace import append_board_metrics, clean_stale_work, compress_log, maintenance_cli, prune_work, work_lock
 from machsuite.cases import cases as machsuite_cases
 from polybench.cases import cases as polybench_cases
 
@@ -589,10 +589,12 @@ def main(suite, tag, config, dry_run, archive_label="", board="xcu250", keep_wor
                     snapshot = run / "config_snapshot" / name
                     snapshot.mkdir()
                     row = dict(board=board, test_name=name, log_file=str(log.relative_to(run)))
+                    clock_ns = None
                     details = {}
                     started = time.monotonic()
                     try:
                         argv, yaml = stage_case(case, snapshot, config_override, paths["bambu"], profile)
+                        clock_ns = next(flag.split("=", 1)[1] for flag in argv if flag.startswith("--clock-period="))
                         row["yaml_config"] = str(yaml.relative_to(run))
                         if dry_run:
                             log.write_text(f"RAMULATOR2_CONFIG={shlex.quote(str(yaml))}\n$ {shlex.join(argv)}\n",
@@ -630,8 +632,21 @@ def main(suite, tag, config, dry_run, archive_label="", board="xcu250", keep_wor
                     output.flush()
                     os.fsync(output.fileno())
                     metadata["cases"][name] = dict(details, status=status, reason=reason,
-                                                   yaml_config=row.get("yaml_config"), log_file=row["log_file"])
+                                                   yaml_config=row.get("yaml_config"), log_file=row["log_file"],
+                                                   timestamp=dt.datetime.now(dt.timezone.utc).isoformat())
                     write_json(run / "metadata.json", metadata)
+                    if not dry_run:
+                        dataset = append_board_metrics(RESULTS, {
+                            "timestamp": metadata["cases"][name]["timestamp"],
+                            "git_commit": metadata["git_commit"], "board": board, "benchmark": name,
+                            "status": status, "cycles": row.get("total_sim_cycles", ""),
+                            "execution_time_s": row.get("wall_time_s", ""),
+                            "dram_reads": row.get("dram_read_reqs", ""), "dram_writes": row.get("dram_write_reqs", ""),
+                            "frequency_mhz": format(1000 / float(clock_ns), ".12g") if clock_ns else "",
+                            "tag": tag,
+                        })
+                        metadata["cases"][name]["board_dataset"] = dataset.name
+                        write_json(run / "metadata.json", metadata)
                     if compressed:
                         try:
                             log.unlink()
@@ -656,6 +671,27 @@ def main(suite, tag, config, dry_run, archive_label="", board="xcu250", keep_wor
         return int(failed)
 
 
+def untrack_runs():
+    """Remove only tracked timestamped run directories from the index, preserving disk data."""
+    tracked = subprocess.run(["git", "ls-files", "-z", "--", "results"], cwd=ROOT,
+                             check=True, stdout=subprocess.PIPE).stdout
+    directories = set()
+    for name in os.fsdecode(tracked).split("\0"):
+        parts = Path(name).parts
+        if not parts or parts[0] != "results":
+            continue
+        for index, part in enumerate(parts[1:-1], 1):
+            if part.startswith("run_"):
+                directories.add(str(Path(*parts[:index + 1])))
+                break
+    if not directories:
+        print("No tracked timestamped run directories found.")
+        return
+    subprocess.run(["git", "--literal-pathspecs", "rm", "-r", "--cached", "--ignore-unmatch",
+                    "--", *sorted(directories)], cwd=ROOT, check=True)
+    print("Staged removal of old run directories from Git; local files were retained.")
+
+
 def interrupt(_signal, _frame):
     raise KeyboardInterrupt
 
@@ -669,6 +705,9 @@ if __name__ == "__main__":
         if sys.argv[1:] == ["--list-boards"]:
             list_boards()
             sys.exit(0)
+        if sys.argv[1:] == ["--untrack-runs"]:
+            untrack_runs()
+            sys.exit(0)
         if sys.argv[1] == "--clean-work":
             maintenance_cli(RESULTS, sys.argv[2:])
             sys.exit(0)
@@ -676,18 +715,24 @@ if __name__ == "__main__":
             board_profile(sys.argv[2])
             sys.exit(0)
         if sys.argv[1] == "--compare-test":
-            compare_test(RESULTS / "archive", sys.argv[2])
+            compare_test(RESULTS, sys.argv[2], load_board_profiles())
+            sys.exit(0)
+        if sys.argv[1] == "--export-summary":
+            output = Path(sys.argv[2]) if len(sys.argv) > 2 else None
+            count = export_summary(RESULTS, output, load_board_profiles())
+            if output is not None:
+                print(f"Exported {count} latest passing rows to {output.resolve()}")
             sys.exit(0)
         if sys.argv[1] == "--export-dataset":
             output = Path(sys.argv[2]) if len(sys.argv) > 2 else RESULTS / "dataset.csv"
-            count = export_dataset(RESULTS / "archive", output)
+            count = export_dataset(RESULTS, output, load_board_profiles())
             print(f"Exported {count} rows to {output.resolve()}")
             sys.exit(0)
         sys.exit(main(*sys.argv[1:4], dry_run=sys.argv[4] == "1",
                       archive_label=sys.argv[5] if len(sys.argv) > 5 else "",
                       board=sys.argv[6] if len(sys.argv) > 6 else "xcu250",
                       keep_work=len(sys.argv) > 7 and sys.argv[7] == "1"))
-    except (OSError, ValueError, KeyError) as exc:
+    except (OSError, ValueError, KeyError, subprocess.CalledProcessError) as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         sys.exit(1)
     except KeyboardInterrupt:

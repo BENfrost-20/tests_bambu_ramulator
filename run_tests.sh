@@ -9,14 +9,19 @@ Usage: run_tests.sh [--smoke | --all | --suite NAME | --clean]
        run_tests.sh --clean-work [--older-than-days N] [--dry-run]
        run_tests.sh --list-boards
        run_tests.sh --export-dataset [output.csv]
+       run_tests.sh --export-summary [output.csv]
        run_tests.sh --compare-test TEST_NAME
+       run_tests.sh --untrack-runs
        run_tests.sh --check-baseline
 Suites: smoke, micro, polybench, machsuite, diagnostic
 Default: --smoke. --all runs the four regular suites.
 --clean removes finished PASS work with saved evidence.
 --keep-work preserves work directories for manual inspection.
 --tmux starts a detached session, or runs inline from an existing tmux pane.
---archive publishes curated telemetry and removes temporary build artifacts.
+Completed tests append to results/<board>.csv; detailed run evidence stays local.
+--archive publishes an additional local evidence snapshot.
+--export-dataset exports all history; --export-summary selects latest PASS per board/test.
+--untrack-runs stages Git removal of old run folders without deleting local files.
 HELP
 }
 
@@ -25,13 +30,13 @@ die() { printf '%s\n' "$*" >&2; exit 2; }
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 export PYTHONDONTWRITEBYTECODE=1
 case "${1:-}" in
-    --check-baseline|--list-boards|--export-dataset|--compare-test|--clean-work)
+    --check-baseline|--list-boards|--export-dataset|--export-summary|--compare-test|--clean-work|--untrack-runs)
         case "$1" in
-            --check-baseline|--list-boards)
+            --check-baseline|--list-boards|--untrack-runs)
                 [[ $# -eq 1 ]] || die "$1 does not take arguments."
                 ;;
-            --export-dataset)
-                [[ $# -le 2 && "${2:-}" != --* ]] || die "--export-dataset takes at most one output path."
+            --export-dataset|--export-summary)
+                [[ $# -le 2 && "${2:-}" != --* ]] || die "$1 takes at most one output path."
                 ;;
             --compare-test)
                 [[ $# -eq 2 && -n "$2" && "$2" != --* ]] || die "--compare-test requires one test name."

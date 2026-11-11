@@ -117,18 +117,20 @@ applies to `--dry-run`. `--clean` can run without the simulation toolchain.
   private working directory, IPC filename, temporary directory and process
   group per case. `--dry-run` stages inputs and commands without synthesis
   or simulation. Tool probes are recorded and successful plans produce a
-  header-only CSV. `--keep-work` disables automatic workspace pruning.
+  header-only local summary; no rows are added to the board dataset.
+  `--keep-work` disables automatic workspace pruning.
   Each simulation command creates its own run record.
 
 ## Board profiles and comparisons
 
 ```bash
 ./run_tests.sh --list-boards
-./run_tests.sh --smoke --board xcu250 --archive board-comparison
-./run_tests.sh --smoke --board xcu280 --archive board-comparison
-./run_tests.sh --smoke --board xcu55c --archive board-comparison
+./run_tests.sh --smoke --board xcu250 --tag board-comparison
+./run_tests.sh --smoke --board xcu280 --tag board-comparison
+./run_tests.sh --smoke --board xcu55c --tag board-comparison
 ./run_tests.sh --compare-test smoke_vector_add
-./run_tests.sh --export-dataset results/cross-board.csv
+./run_tests.sh --export-summary
+./run_tests.sh --export-summary results/cross-board.csv
 ```
 
 Profiles live in [configs/boards.json](configs/boards.json). The default board
@@ -136,7 +138,7 @@ is `xcu250`.
 
 | Board | Bambu device | Clock (ns) | Memory config | Status |
 |---|---|---:|---|---|
-| `xcu250` | `xcu280-2Lfsvh2892` | 5.0 | `configs/xcu250_ddr4_2400R.yaml`, DDR4, 4 channels | stable |
+| `xcu250` | `xcu250-figd2104-2L-e` | 5.0 | `configs/xcu250_ddr4_2400R.yaml`, DDR4, 4 channels | stable |
 | `xcu280` | `xcu280-2Lfsvh2892` | 4.0 | `configs/xcu280_hbm2.yaml`, HBM2, 32 channels | experimental |
 | `xcu55c` | `xcu55c-2Lfsvh2892` | 3.33 | `configs/xcu280_hbm2.yaml`, HBM2e target, 32 channels | experimental |
 
@@ -165,9 +167,13 @@ The diagnostic suite keeps its explicit DDR3/DDR5/HBM2 probes and uses the
 selected board's clock. Both the full profile and actual case arguments are
 retained in the run metadata.
 
-`--compare-test NAME` reads all archived trials for that test and displays
-board, status, cycles, request counts, clock, config and timestamp. It shows
-individual trials so experiments with different parameters remain identifiable.
+`--compare-test NAME` reads `results/<board>.csv` and displays the latest
+**passing** entry per board for that benchmark, including frequency and tag.
+A newer `FAIL` or `ERROR` does not replace an earlier pass. Boards with no
+passing entry are omitted. UTC timestamps determine recency; the last appended
+row wins a timestamp tie. `--export-summary` applies the same selection to
+every benchmark and prints a combined table, or writes it to the optional
+output CSV. Reporting commands run without the simulation toolchain.
 
 ## Running Long Test Suites in Background (tmux)
 
@@ -241,6 +247,40 @@ when grouping those experiments.
 
 ## Run records and calibration
 
+Every completed test appends one row to the canonical dataset
+`results/<board>.csv`, including `FAIL` and `ERROR` outcomes. Repeated runs
+preserve all history. An exclusive file lock covers header validation and
+appending, followed by a flush to disk; concurrent runners cannot interleave
+rows or duplicate the header. Readers use a shared lock. An incompatible
+existing header stops the append and preserves the file for inspection.
+Completed case metrics are saved before workspace pruning, even if a later
+case fails or the suite is interrupted. Preflight failures, dry runs and
+maintenance commands do not add measurement rows.
+
+All board datasets use this exact schema:
+
+```csv
+timestamp,git_commit,board,benchmark,status,cycles,execution_time_s,dram_reads,dram_writes,frequency_mhz,tag
+```
+
+`timestamp` is the UTC test completion time (imported historical entries use
+the recorded run timestamp when completion time is unavailable).
+`git_commit` identifies the suite checkout, and `benchmark` is the case name (for example `smoke_vector_add`).
+`cycles` counts accelerator cycles; `dram_reads` and `dram_writes` count
+accepted requests. `execution_time_s` is measured **host wall time** for the
+Bambu invocation (the local summary's `wall_time_s`). `frequency_mhz` is the
+requested HLS frequency, computed as `1000 / clock_period_ns`, including any
+`CLOCK_PERIOD_NS` override; it is not a measured post-route FPGA frequency.
+Unavailable metrics are empty. Use `tag` to identify memory/clock parameter
+sweeps; the exact YAML and arguments remain in the local run snapshot.
+
+Under `results/`, only top-level CSVs are eligible for Git tracking:
+`xcu250.csv`, `xcu280.csv`, `xcu55c.csv` as those boards are run, and optional
+combined datasets such as `cross-board.csv`. This keeps Git diffs focused on
+numerical records and makes `pandas.read_csv("results/xcu280.csv")` sufficient
+for plotting or fitting. Timestamped run directories, archives, logs, work
+trees and metadata snapshots remain local and are ignored by Git.
+
 Each run creates `results/run_YYYYMMDD_HHMMSS_<tag>/` in UTC and atomically
 updates `results/latest` to point to the new run. A numeric suffix distinguishes
 same-second collisions. Run tags label experiments. Use a unique, descriptive
@@ -259,6 +299,9 @@ tag for each calibration sweep.
   accepted read/write requests, and paths relative to the run. Retried requests
   count once when the controller accepts them. Write counts track acceptance.
   Read completions and tick totals are in the case metadata.
+
+These detailed per-run summaries remain available for debugging; comparison
+and export commands read the canonical board datasets directly.
 
 A pass requires successful Bambu and testbench completion, functional checks,
 and an accepted Ramulator read with a completion under the recorded YAML.
@@ -298,11 +341,26 @@ symlinks are skipped. Archives, run metadata, CSV summaries and configuration
 snapshots are retained. `--clean` applies the same safeguards to completed
 runs without an age limit.
 
-### Archive an experiment
+To stop tracking previously committed timestamped directories while retaining
+every local file, run once from the suite directory:
+
+```bash
+./run_tests.sh --untrack-runs
+git diff --cached --stat
+```
+
+This stages cached-only removals for tracked `results/run_*/` directories and
+`results/archive/<board>/run_*/` directories. It is the safe, glob-free
+equivalent of `git rm -r --cached results/run_*`, and does not delete disk
+data. Commit those removals alongside the board CSVs when ready. `.gitignore`
+alone cannot untrack files already committed.
+
+### Local evidence snapshots and dataset exports
 
 ```bash
 ./run_tests.sh --suite micro --config configs/xcu250_ddr4_2400R.yaml --archive ddr4-four-channel
 ./run_tests.sh --export-dataset results/calibration.csv
+./run_tests.sh --export-summary results/cross-board.csv
 ```
 
 `--archive LABEL` publishes finished simulations, including failed cases, in
@@ -314,34 +372,22 @@ records. The archive contains only `metadata.json`, `summary.csv`,
 Bambu arguments and source/input hashes. Publication preserves the per-case
 workspace retention policy, including error work and `--keep-work`. The local summary
 references the compressed logs, and `results/latest` still points at the local
-run. Under `results/`, Git can track `metadata.json`, `summary.csv` and exported
-CSV datasets such as `cross-board.csv`. Raw logs, compressed log archives,
-configuration snapshots and temporary work are ignored. The full on-disk
-archive retains the execution evidence for local inspection.
+run. This optional archive is entirely local; `--archive` is not required
+for appending metrics to the canonical board CSV.
 
-`--export-dataset [output.csv]` reads the archives without running preflight
-and writes one row per case, including its status. The default output is
-`results/dataset.csv`. Columns include run identity, YAML and input hashes,
-DRAM timing and topology, HLS options and `define_*` macros, and the observed
-cycles, wall time and request counts. Its first columns are `board`,
-`test_name`, `status`, `cycles`, `dram_reads`, `dram_writes`, `clock_ns`,
-`ramulator_config` and `timestamp`. The existing metric names remain available
-as additional columns. `hls_flags` retains the complete argument array as JSON
-in one CSV column.
-
-Export and comparison also read the earlier flat archive layout. For those
-records, the board is inferred from the stored device flag when available,
-otherwise it is reported as `unknown`.
-
-The exporter reads scalar YAML block mappings and JSON-formatted YAML. It
-resolves the timing presets shipped in `configs/` against the pinned Ramulator
-source. Explicit cycle overrides take precedence over nanosecond values.
-For a nanosecond-only override, the CSV records the requested value and leaves
-its cycle field blank. Unsupported YAML mappings and unknown preset values
-leave affected fields blank and are described in `dram_feature_note`.
+`--export-dataset [output.csv]` reads all top-level board CSVs and writes the
+full measurement history, including failures, using the canonical schema. The
+default output is `results/dataset.csv`. Combined exports are excluded from
+subsequent reads so rerunning an export does not duplicate rows. Exports
+cannot overwrite a canonical board file. `--export-summary [output.csv]`
+instead selects the latest passing entry per board/benchmark; without a path
+it prints a console table. Older archive summaries are local evidence, not
+reporting inputs. Detailed YAML/HLS features and hashes remain in the local
+snapshots when a model needs more features than the compact dataset contains.
 
 For fitting, filter to `PASS` rows with the metrics and features your model
 uses. When pairing simulation and hardware measurements, match the workload
-and input hashes and use the same start-to-done window. Multiply
-`total_sim_cycles` by `hls_clock_period_ns` to get simulated nanoseconds.
-`wall_time_s` measures host execution time.
+and input hashes in the snapshots and use the same start-to-done window.
+Compute simulated nanoseconds as `cycles * 1000 / frequency_mhz`.
+Compare matching tags and frequencies when varying parameters across boards;
+the latest-pass summary deliberately does not group by parameter settings.

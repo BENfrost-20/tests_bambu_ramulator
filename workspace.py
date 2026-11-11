@@ -1,4 +1,4 @@
-"""Compress evidence and prune generated work while protecting active and failed runs."""
+"""Append board metrics and prune generated work while protecting run evidence."""
 
 from contextlib import contextmanager, suppress
 import argparse
@@ -8,10 +8,56 @@ import gzip
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import socket
 import tempfile
 import time
+from io import StringIO
+
+
+BOARD_COLUMNS = (
+    "timestamp", "git_commit", "board", "benchmark", "status", "cycles",
+    "execution_time_s", "dram_reads", "dram_writes", "frequency_mhz", "tag",
+)
+
+
+def append_board_metrics(results, record):
+    """Append one complete trial while holding the board CSV's exclusive lock."""
+    board = record["board"]
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", board):
+        raise ValueError(f"Invalid dataset board {board}")
+    results.mkdir(parents=True, exist_ok=True)
+    path = results / f"{board}.csv"
+    if path.is_symlink():
+        raise ValueError(f"Canonical board CSV must be a regular file: {path}")
+    with path.open("a+", encoding="utf-8", newline="") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        handle.seek(0)
+        header = next(csv.reader(handle), None)
+        if header is not None and header != list(BOARD_COLUMNS):
+            raise ValueError(f"Incompatible CSV header in {path}. Preserve it and choose a separate export path.")
+        position = handle.seek(0, os.SEEK_END)
+        if position and os.pread(handle.fileno(), 1, position - 1) not in (b"\n", b"\r"):
+            raise ValueError(f"Incomplete final CSV line in {path}; inspect it before appending")
+        with StringIO(newline="") as buffer:
+            writer = csv.DictWriter(buffer, BOARD_COLUMNS, lineterminator="\n")
+            if position == 0:
+                writer.writeheader()
+            writer.writerow(record)
+            payload = buffer.getvalue()
+        try:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        except (OSError, UnicodeError, KeyboardInterrupt):
+            with suppress(OSError):
+                handle.seek(position)
+                handle.truncate()
+                handle.flush()
+                os.fsync(handle.fileno())
+            raise
+    return path
 
 
 @contextmanager

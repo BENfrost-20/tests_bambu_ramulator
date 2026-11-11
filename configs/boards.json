@@ -1,7 +1,7 @@
-
+[
   {
     "name": "xcu250",
-    "bambu_device": "xcu280-2Lfsvh2892",
+    "bambu_device": "xcu250-figd2104-2L-e",
     "default_clock_ns": 5.0,
     "default_ramulator_yaml": "configs/xcu250_ddr4_2400R.yaml",
     "description": "Xilinx Alveo U250 - four-channel DDR4-2400R",

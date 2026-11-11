@@ -1,11 +1,9 @@
-# Track numerical experiment records and datasets under results.
+# Only canonical board CSVs and combined CSV exports belong in Git.
 /results/**
-!/results/**/
-!/results/**/metadata.json
-!/results/**/summary.csv
-!/results/**/*.csv
+!/results/*.csv
 
 # Keep execution evidence, snapshots and temporary work local.
+/results/run_*/
 /results/**/logs/
 /results/**/work/
 /results/**/config_snapshot/
